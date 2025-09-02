@@ -20,24 +20,51 @@ def _masked_mean_pool(last_hidden_state: torch.Tensor,
     return summed / denom
 
 
-def _try_load_partial_weights(module: nn.Module, ckpt_path: str, strict_key: str = "model") -> bool:
+def _try_load_partial_state_dict(module: nn.Module, sd) -> bool:
     """
-    Cố gắng load state_dict một phần (không strict) nếu tồn tại file.
-    Trả về True nếu load được, ngược lại False.
+    Cố gắng nạp state_dict vào `module` ở chế độ non-strict (partial init).
+    Hỗ trợ cả đường dẫn (dict đã load) lẫn dict trực tiếp.
     """
     try:
-        if not ckpt_path or not os.path.isfile(ckpt_path):
+        if isinstance(sd, str):
+            if not os.path.isfile(sd):
+                return False
+            sd = torch.load(sd, map_location="cpu")
+            # cho phép bọc trong khoá 'model'
+            if isinstance(sd, dict) and "model" in sd:
+                sd = sd["model"]
+
+        if not isinstance(sd, dict):
             return False
-        sd = torch.load(ckpt_path, map_location="cpu")
-        if isinstance(sd, dict) and strict_key in sd:
-            sd = sd[strict_key]
+
         missing, unexpected = module.load_state_dict(sd, strict=False)
-        # Không raise nếu thiếu/ dư key — chấp nhận partial init
-        print(f"[INFO] Partially loaded weights from: {ckpt_path}\n"
-              f" - missing: {len(missing)} keys, unexpected: {len(unexpected)} keys")
+        print(
+            "[INFO] Partially loaded weights\n"
+            f" - missing: {len(missing)} keys, unexpected: {len(unexpected)} keys"
+        )
         return True
     except Exception as e:
-        print(f"[WARN] Could not load partial weights from {ckpt_path}: {e}")
+        print(f"[WARN] Could not partially load weights: {e}")
+        return False
+
+
+def _try_load_from_torchvision_detr(module: nn.Module) -> bool:
+    """
+    Load weight từ DETR ResNet-50 pretrained có sẵn trong torchvision,
+    KHÔNG cần file .pth ngoài. Nạp theo non-strict để tận dụng tối đa các lớp trùng tên.
+    """
+    try:
+        from torchvision.models.detection import detr_resnet50
+        from torchvision.models.detection.detr import Detr_ResNet50_Weights
+
+        detr_model = detr_resnet50(weights=Detr_ResNet50_Weights.COCO_V1)
+        sd = detr_model.state_dict()
+        missing, unexpected = module.load_state_dict(sd, strict=False)
+        print("[INFO] Partially loaded from torchvision DETR (COCO_V1)")
+        print(f" - missing: {len(missing)} keys, unexpected: {len(unexpected)} keys")
+        return True
+    except Exception as e:
+        print(f"[WARN] Could not load DETR weights from torchvision: {e}")
         return False
 
 
@@ -49,27 +76,38 @@ class MGVLF(nn.Module):
       - Text encoder: BERT (bert-base-uncased mặc định) => token features (B,L,768) + sentence feature (B,768)
       - Visual encoder: CNN_MGVLF => multi-scale fusion feature (B,256,H',W')
       - VL Fusion: VLFusion => pooled vector (B,256)
-      - Head: MLP => bbox (cx, cy, w, h) chuẩn hóa ~ [0,1], sau đó map về (-0.5, 1.5) để linh hoạt
+      - Head: MLP => bbox (cx, cy, w, h) chuẩn hóa trong (-0.5, 1.5) sau khi map
+
+    Điểm khác biệt chính:
+      - Không cần tải thủ công file 'detr-r50-e632da11.pth'.
+        Thay vào đó, ta load trực tiếp pretrained DETR từ torchvision
+        và nạp partial vào các module phù hợp.
     """
 
     def __init__(self,
                  bert_model: str = "bert-base-uncased",
                  tunebert: bool = True,
                  args: Optional[object] = None,
-                 init_visual_from: str = "./saved_models/detr-r50-e632da11.pth",
-                 init_vl_from: str = "./saved_models/detr-r50-e632da11.pth"):
+                 use_torchvision_detr_init: bool = True,
+                 also_init_vl_from_detr: bool = True):
+        """
+        Args:
+            bert_model: tên model BERT trong HuggingFace.
+            tunebert: có fine-tune BERT hay không.
+            args: cấu hình cho các module vision/VL (được build ở .CNN_MGVLF).
+            use_torchvision_detr_init: nếu True, sẽ lấy weight từ torchvision DETR để init phần nhìn.
+            also_init_vl_from_detr: nếu True, thử nạp partial cả vào VL fusion (an toàn vì non-strict).
+        """
         super().__init__()
 
         self.tunebert = tunebert
 
         # ---- Text encoder (BERT) ----
-        # Luôn dùng return_dict + hidden states để lấy 4 layer cuối
         self.bert_name = bert_model
         self.bert_config = AutoConfig.from_pretrained(self.bert_name)
         self.textmodel = AutoModel.from_pretrained(self.bert_name)
         self.textdim = getattr(self.bert_config, "hidden_size", 768)
 
-        # Có thể freeze BERT nếu không tune
         if not self.tunebert:
             for p in self.textmodel.parameters():
                 p.requires_grad = False
@@ -77,20 +115,25 @@ class MGVLF(nn.Module):
         # ---- Visual encoder (CNN+Transformer) ----
         self.visumodel = build_CNN_MGVLF(args)
 
-        # (tùy chọn) thử load partial weights nếu có
-        _try_load_partial_weights(self.visumodel, init_visual_from)
+        # (khuyến nghị) khởi tạo từ torchvision DETR nếu sẵn
+        if use_torchvision_detr_init:
+            loaded = _try_load_from_torchvision_detr(self.visumodel)
+            if not loaded:
+                print("[INFO] Fallback: skip DETR init for visual backbone.")
 
         # ---- VL fusion encoder ----
         self.vlmodel = build_VLFusion(args)
-        _try_load_partial_weights(self.vlmodel, init_vl_from)
+
+        if use_torchvision_detr_init and also_init_vl_from_detr:
+            _ = _try_load_from_torchvision_detr(self.vlmodel)
 
         # ---- Prediction head ----
+        hidden_dim = getattr(args, "hidden_dim", 256)
         self.Prediction_Head = nn.Sequential(
-            nn.Linear(args.hidden_dim if hasattr(args, "hidden_dim") else 256, 256),
+            nn.Linear(hidden_dim, 256),
             nn.ReLU(inplace=True),
             nn.Linear(256, 4),
         )
-        # init Xavier cho các layer Linear
         for m in self.Prediction_Head.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
@@ -104,42 +147,40 @@ class MGVLF(nn.Module):
                 word_mask: torch.Tensor    # (B, L)
                 ) -> torch.Tensor:
         """
-        Trả về: outbox (B, 4) với format (cx, cy, w, h) trong khoảng gần [0,1]
-                sau đó được map sigmoid*2 - 0.5 => (-0.5, 1.5)
+        Trả về: outbox (B, 4) với format (cx, cy, w, h)
+        Sau head: sigmoid * 2 - 0.5 => phạm vi (-0.5, 1.5) cho linh hoạt biên ảnh.
         """
         # ---- Text encoding ----
-        # Lấy hidden states từ 4 layer cuối để làm token features
         outputs = self.textmodel(
             input_ids=word_id,
             attention_mask=word_mask,
             output_hidden_states=True,
             return_dict=True
         )
-        hidden_states = outputs.hidden_states  # tuple(len=layers+1) of (B,L,D)
-        last_hidden_state = outputs.last_hidden_state  # (B,L,D)
-        pooler = getattr(outputs, "pooler_output", None)  # có thể None (với vài model)
+        hidden_states = outputs.hidden_states             # tuple(len=layers+1) of (B,L,D)
+        last_hidden_state = outputs.last_hidden_state     # (B,L,D)
+        pooler = getattr(outputs, "pooler_output", None)  # có thể None
 
-        # Sentence feature: nếu không có pooler_output -> dùng mean pooling theo mask
+        # Sentence feature
         if pooler is None or pooler.numel() == 0:
-            sentence_feature = _masked_mean_pool(last_hidden_state, word_mask)
+            sentence_feature = _masked_mean_pool(last_hidden_state, word_mask)  # (B,D)
         else:
-            sentence_feature = pooler  # (B, D)
+            sentence_feature = pooler
 
         # Token features: trung bình 4 lớp cuối
         fl = (hidden_states[-1] + hidden_states[-2] + hidden_states[-3] + hidden_states[-4]) / 4.0
-        # Nếu không tune BERT -> detach để tránh backprop vào BERT
+
         if not self.tunebert:
             fl = fl.detach()
             sentence_feature = sentence_feature.detach()
 
         # ---- Visual encoder (multi-scale) ----
-        # visumodel kỳ vọng: (img, mask, word_mask, token_feats(B,L,D), sent_feat(B,D))
         fv = self.visumodel(image, mask, word_mask, fl, sentence_feature)  # (B,256,H',W')
 
-        # ---- VL Fusion (ra vector) ----
+        # ---- VL Fusion (pooled vector) ----
         fused = self.vlmodel(fv, fl)  # (B, 256) — theo thiết kế của VLFusion
 
         # ---- BBox head ----
-        outbox = self.Prediction_Head(fused)          # (B, 4) — (cx, cy, w, h) unbounded
-        outbox = outbox.sigmoid() * 2.0 - 0.5         # map sang (-0.5, 1.5) để linh hoạt
+        outbox = self.Prediction_Head(fused)     # (B, 4) — (cx, cy, w, h) unbounded
+        outbox = outbox.sigmoid() * 2.0 - 0.5    # map sang (-0.5, 1.5)
         return outbox
