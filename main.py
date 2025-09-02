@@ -88,7 +88,7 @@ def build_dataloaders(args):
     train_dataset = RSVGDataset(
         images_path=args.images_path,
         anno_path=args.anno_path,
-        split_root=args.split_root,
+        splits_dir=args.split_root,
         split='train',
         imsize=args.size,
         transform=input_transform,
@@ -98,7 +98,7 @@ def build_dataloaders(args):
     val_dataset = RSVGDataset(
         images_path=args.images_path,
         anno_path=args.anno_path,
-        split_root=args.split_root,
+        splits_dir=args.split_root,
         split='val',
         imsize=args.size,
         transform=input_transform,
@@ -108,7 +108,7 @@ def build_dataloaders(args):
     test_dataset = RSVGDataset(
         images_path=args.images_path,
         anno_path=args.anno_path,
-        split_root=args.split_root,
+        splits_dir=args.split_root,
         split='test',
         imsize=args.size,
         transform=input_transform,
