@@ -272,8 +272,7 @@ def validate_epoch(val_loader, model, args):
 
         giou_loss = GIoU_Loss(pred_bbox * (args.size - 1), bbox, args.size - 1)
         l1_loss = Reg_Loss(pred_bbox, xyxy2xywh(bbox) / (args.size - 1))
-        loss_eiou = EIoU_Loss_Compat(pred_bbox * (args.size - 1), gt_bbox, args.size - 1)
-
+        loss_eiou = EIoU_Loss_Compat(pred_bbox * (args.size - 1), bbox, args.size - 1)
         loss = giou_loss + l1_loss + loss_eiou
 
         losses.update(loss.item(), imgs.size(0))
