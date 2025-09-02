@@ -3,8 +3,7 @@ from typing import Optional
 
 import torch
 from torch import nn
-from transformers import AutoModel, AutoConfig
-
+from transformers import AutoModel, AutoConfig, DetrForObjectDetection
 from .CNN_MGVLF import build_VLFusion, build_CNN_MGVLF
 
 
@@ -48,23 +47,20 @@ def _try_load_partial_state_dict(module: nn.Module, sd) -> bool:
         return False
 
 
-def _try_load_from_torchvision_detr(module: nn.Module) -> bool:
+def _try_load_from_hf_detr(module: nn.Module) -> bool:
     """
-    Load weight từ DETR ResNet-50 pretrained có sẵn trong torchvision,
-    KHÔNG cần file .pth ngoài. Nạp theo non-strict để tận dụng tối đa các lớp trùng tên.
+    Load weight từ DETR ResNet-50 pretrained của HuggingFace (facebook/detr-resnet-50).
+    Nạp non-strict để tận dụng tối đa các lớp trùng tên.
     """
     try:
-        from torchvision.models.detection import detr_resnet50
-        from torchvision.models.detection.detr import Detr_ResNet50_Weights
-
-        detr_model = detr_resnet50(weights=Detr_ResNet50_Weights.COCO_V1)
+        detr_model = DetrForObjectDetection.from_pretrained("facebook/detr-resnet-50")
         sd = detr_model.state_dict()
         missing, unexpected = module.load_state_dict(sd, strict=False)
-        print("[INFO] Partially loaded from torchvision DETR (COCO_V1)")
+        print("[INFO] Partially loaded from HuggingFace DETR (facebook/detr-resnet-50)")
         print(f" - missing: {len(missing)} keys, unexpected: {len(unexpected)} keys")
         return True
     except Exception as e:
-        print(f"[WARN] Could not load DETR weights from torchvision: {e}")
+        print(f"[WARN] Could not load DETR weights from HuggingFace: {e}")
         return False
 
 
@@ -115,17 +111,13 @@ class MGVLF(nn.Module):
         # ---- Visual encoder (CNN+Transformer) ----
         self.visumodel = build_CNN_MGVLF(args)
 
-        # (khuyến nghị) khởi tạo từ torchvision DETR nếu sẵn
-        if use_torchvision_detr_init:
-            loaded = _try_load_from_torchvision_detr(self.visumodel)
-            if not loaded:
-                print("[INFO] Fallback: skip DETR init for visual backbone.")
+    # Luôn khởi tạo từ HuggingFace DETR
+        _try_load_from_hf_detr(self.visumodel)
 
         # ---- VL fusion encoder ----
         self.vlmodel = build_VLFusion(args)
 
-        if use_torchvision_detr_init and also_init_vl_from_detr:
-            _ = _try_load_from_torchvision_detr(self.vlmodel)
+        _try_load_from_hf_detr(self.vlmodel)
 
         # ---- Prediction head ----
         hidden_dim = getattr(args, "hidden_dim", 256)
