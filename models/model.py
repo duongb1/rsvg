@@ -3,9 +3,9 @@ from typing import Optional
 
 import torch
 from torch import nn
-from transformers import AutoModel, AutoConfig, DetrForObjectDetection
+from transformers import AutoModel, AutoConfig
 from .CNN_MGVLF import build_VLFusion, build_CNN_MGVLF
-
+from torchvision.models.detection import detr_resnet50, Detr_ResNet50_Weights
 
 def _masked_mean_pool(last_hidden_state: torch.Tensor,
                       attention_mask: torch.Tensor) -> torch.Tensor:
@@ -48,20 +48,20 @@ def _try_load_partial_state_dict(module: nn.Module, sd) -> bool:
 
 
 def _try_load_from_hf_detr(module: nn.Module) -> bool:
-    """
-    Load weight từ DETR ResNet-50 pretrained của HuggingFace (facebook/detr-resnet-50).
-    Nạp non-strict để tận dụng tối đa các lớp trùng tên.
-    """
     try:
-        detr_model = DetrForObjectDetection.from_pretrained("facebook/detr-resnet-50")
+        
+        # Use the recommended weights argument
+        detr_model = detr_resnet50(weights=Detr_ResNet50_Weights.DEFAULT)
         sd = detr_model.state_dict()
-        missing, unexpected = module.load_state_dict(sd, strict=False)
-        print("[INFO] Partially loaded from HuggingFace DETR (facebook/detr-resnet-50)")
+        # thêm assign=True để materialize meta tensors
+        missing, unexpected = module.load_state_dict(sd, strict=False, assign=True)
+        print("[INFO] Partially loaded from TorchVision DETR (detr_resnet50)")
         print(f" - missing: {len(missing)} keys, unexpected: {len(unexpected)} keys")
         return True
     except Exception as e:
-        print(f"[WARN] Could not load DETR weights from HuggingFace: {e}")
+        print(f"[WARN] Could not load DETR weights from TorchVision: {e}")
         return False
+
 
 
 class MGVLF(nn.Module):
