@@ -2,7 +2,7 @@
 import os
 import warnings
 
-# --- Giảm ồn TensorFlow/XLA trong môi trường Kaggle ---
+# --- Giảm ồn TensorFlow/XLA trong môi trường Kaggle/Colab ---
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 try:
     import absl.logging as _absl_logging
@@ -12,6 +12,7 @@ except Exception:
 warnings.filterwarnings("ignore", message="The parameter 'pretrained' is deprecated")
 
 import argparse
+import sys
 import time
 import logging
 import datetime
@@ -20,15 +21,17 @@ import random
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
+import torch.optim
 import torch.nn as nn
 
 from torchvision.transforms import Compose, ToTensor, Normalize
 from torch.utils.data import DataLoader
+from torch.autograd import Variable  # giữ để tương thích, dù không dùng trực tiếp
 
-# ---- schedulers từ HuggingFace ----
+# ---- schedulers từ HuggingFace cho warmup/decay ----
 from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
 
-# ---- local imports ----
+# ---- local imports (refactor) ----
 from dataset import RSVGDataset
 from models.model import MGVLF
 from utils.loss import Reg_Loss, GIoU_Loss
@@ -42,11 +45,14 @@ from torch.cuda.amp import autocast, GradScaler
 def parse_args():
     parser = argparse.ArgumentParser(description="MGVLF Remote Sensing Grounding (Kaggle/Colab-ready)")
     # data
-    parser.add_argument('--images_path', type=str, default='/kaggle/input/dior-rsvg/DIOR_RSVG/JPEGImages')
-    parser.add_argument('--anno_path', type=str, default='/kaggle/input/dior-rsvg/DIOR_RSVG/Annotations')
-    parser.add_argument('--split_root', type=str, default='/kaggle/input/dior-rsvg/DIOR_RSVG')
-    parser.add_argument('--size', default=640, type=int)
-    parser.add_argument('--time', default=40, type=int)
+    parser.add_argument('--images_path', type=str, default='/kaggle/input/dior-rsvg/DIOR_RSVG/JPEGImages',
+                        help='path to images')
+    parser.add_argument('--anno_path', type=str, default='/kaggle/input/dior-rsvg/DIOR_RSVG/Annotations',
+                        help='path to VOC-style xml annotations')
+    parser.add_argument('--split_root', type=str, default='/kaggle/input/dior-rsvg/DIOR_RSVG',
+                        help='folder contains train.txt/val.txt/test.txt')
+    parser.add_argument('--size', default=640, type=int, help='image size (square)')
+    parser.add_argument('--time', default=40, type=int, help='max text length per sample')
     # train
     parser.add_argument('--nb_epoch', default=150, type=int)
     parser.add_argument('--batch_size', default=16, type=int)
@@ -56,36 +62,45 @@ def parse_args():
     parser.add_argument('--seed', default=13, type=int)
     parser.add_argument('--print_freq', default=50, type=int)
     parser.add_argument('--savename', default='default', type=str)
-    parser.add_argument('--resume', default='', type=str)
-    parser.add_argument('--pretrain', default='', type=str)
-    parser.add_argument('--tunebert', default=True, action='store_true')
-    parser.add_argument('--test', default=False, action='store_true')
+    parser.add_argument('--resume', default='', type=str, metavar='PATH')
+    parser.add_argument('--pretrain', default='', type=str, metavar='PATH')
+    parser.add_argument('--tunebert', dest='tunebert', default=True, action='store_true')
+    parser.add_argument('--test', dest='test', default=False, action='store_true')
     # model
-    parser.add_argument('--bert_model', default='bert-base-uncased', type=str)
+    parser.add_argument('--bert_model', default='bert-base-uncased', type=str,
+                        help='English BERT checkpoint or local path')
     parser.add_argument('--device', default='cuda', type=str)
     parser.add_argument('--backbone', default='resnet50', type=str)
     parser.add_argument('--dilation', action='store_true')
-    parser.add_argument('--masks', action='store_true')
-    parser.add_argument('--position_embedding', default='sine', choices=('sine', 'learned'))
+    parser.add_argument('--masks', action='store_true', help='return intermediate layers (always on internally)')
+    parser.add_argument('--position_embedding', default='sine', type=str, choices=('sine', 'learned'))
     parser.add_argument('--enc_layers', default=6, type=int)
     parser.add_argument('--dec_layers', default=6, type=int)
     parser.add_argument('--dim_feedforward', default=2048, type=int)
     parser.add_argument('--hidden_dim', default=256, type=int)
     parser.add_argument('--dropout', default=0.1, type=float)
     parser.add_argument('--nheads', default=8, type=int)
-    parser.add_argument('--num_queries', default=441, type=int)
+    parser.add_argument('--num_queries', default=441, type=int)  # unused, kept for compatibility
     parser.add_argument('--pre_norm', action='store_true')
-    # perf toggles
-    parser.add_argument('--compile', action='store_true')
-    parser.add_argument('--use_torchvision_detr_init', action='store_true', default=False)
-    parser.add_argument('--also_init_vl_from_detr', action='store_true', default=False)
-    # HF BERT controls
-    parser.add_argument('--bert_freeze_layers', type=int, default=0)
-    parser.add_argument('--bert_lr', type=float, default=None)
-    parser.add_argument('--bert_llrd', type=float, default=0.95)
-    parser.add_argument('--bert_grad_ckpt', action='store_true', default=False)
-    parser.add_argument('--sched_warmup_ratio', type=float, default=0.06)
-    parser.add_argument('--sched_type', type=str, default='linear', choices=['linear', 'cosine'])
+    # performance toggles
+    parser.add_argument('--compile', action='store_true', help='use torch.compile if available')
+    parser.add_argument('--use_torchvision_detr_init', action='store_true', default=False,
+                        help='try to init visual backbone from torchvision DETR weights (if available)')
+    parser.add_argument('--also_init_vl_from_detr', action='store_true', default=False,
+                        help='also try partial init for VL fusion from DETR (non-strict)')
+    # ---- HuggingFace BERT controls ----
+    parser.add_argument('--bert_freeze_layers', type=int, default=0,
+                        help='Freeze n first encoder layers of BERT (0 = no freeze)')
+    parser.add_argument('--bert_lr', type=float, default=None,
+                        help='separate LR for BERT params (default: args.lr/10 if tunebert)')
+    parser.add_argument('--bert_llrd', type=float, default=0.95,
+                        help='Layer-wise LR decay for BERT (e.g., 0.95)')
+    parser.add_argument('--bert_grad_ckpt', action='store_true', default=False,
+                        help='Enable gradient checkpointing for BERT (save VRAM)')
+    parser.add_argument('--sched_warmup_ratio', type=float, default=0.06,
+                        help='Warmup ratio of total steps (e.g., 0.06 = 6%)')
+    parser.add_argument('--sched_type', type=str, default='linear',
+                        choices=['linear', 'cosine'], help='LR scheduler type')
     return parser.parse_args()
 
 
@@ -100,15 +115,43 @@ def set_seed(seed: int):
 
 
 def build_dataloaders(args):
-    tfm = Compose([ToTensor(),
-                   Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225])])
-    train_dataset = RSVGDataset(args.images_path, args.anno_path, args.split_root,
-                                'train', args.size, tfm, args.time, args.bert_model)
-    val_dataset = RSVGDataset(args.images_path, args.anno_path, args.split_root,
-                              'val', args.size, tfm, args.time, args.bert_model)
-    test_dataset = RSVGDataset(args.images_path, args.anno_path, args.split_root,
-                               'test', args.size, tfm, args.time, args.bert_model, testmode=True)
+    input_transform = Compose([
+        ToTensor(),
+        Normalize(mean=[0.485, 0.456, 0.406],
+                  std=[0.229, 0.224, 0.225])
+    ])
+
+    train_dataset = RSVGDataset(
+        images_path=args.images_path,
+        anno_path=args.anno_path,
+        splits_dir=args.split_root,
+        split='train',
+        imsize=args.size,
+        transform=input_transform,
+        max_query_len=args.time,
+        bert_model=args.bert_model
+    )
+    val_dataset = RSVGDataset(
+        images_path=args.images_path,
+        anno_path=args.anno_path,
+        splits_dir=args.split_root,
+        split='val',
+        imsize=args.size,
+        transform=input_transform,
+        max_query_len=args.time,
+        bert_model=args.bert_model
+    )
+    test_dataset = RSVGDataset(
+        images_path=args.images_path,
+        anno_path=args.anno_path,
+        splits_dir=args.split_root,
+        split='test',
+        imsize=args.size,
+        transform=input_transform,
+        max_query_len=args.time,
+        testmode=True,
+        bert_model=args.bert_model
+    )
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
                               pin_memory=True, drop_last=True, num_workers=args.workers,
@@ -124,11 +167,13 @@ def build_dataloaders(args):
 
 
 def build_model(args):
-    model = MGVLF(bert_model=args.bert_model,
-                  tunebert=args.tunebert,
-                  args=args,
-                  use_torchvision_detr_init=args.use_torchvision_detr_init,
-                  also_init_vl_from_detr=args.also_init_vl_from_detr)
+    model = MGVLF(
+        bert_model=args.bert_model,
+        tunebert=args.tunebert,
+        args=args,
+        use_torchvision_detr_init=args.use_torchvision_detr_init,
+        also_init_vl_from_detr=args.also_init_vl_from_detr
+    )
     model = nn.DataParallel(model) if torch.cuda.device_count() > 1 else model
     device = torch.device('cuda' if torch.cuda.is_available() and args.device.startswith('cuda') else 'cpu')
     model = model.to(device)
@@ -142,66 +187,74 @@ def build_model(args):
 
 
 def _no_decay(name: str) -> bool:
-    return any(nd in name for nd in ["bias", "LayerNorm.weight", "layer_norm.weight", "layernorm.weight"])
+    """Helper: quyết định tham số nào không weight decay (bias, LayerNorm)."""
+    nd_list = ["bias", "LayerNorm.weight", "layer_norm.weight", "layernorm.weight"]
+    return any(nd in name for nd in nd_list)
 
 
 def optimizer_for(model: nn.Module, args):
-    """Safe optimizer grouping with LLRD for BERT + DP-safe."""
-    m = model.module if isinstance(model, nn.DataParallel) else model
-
     if args.tunebert:
+        m = model.module if isinstance(model, nn.DataParallel) else model
         visu_param = list(m.visumodel.parameters())
-        text_param = list(m.textmodel.parameters())
-        visu_ids = {id(p) for p in visu_param}
-        text_ids = {id(p) for p in text_param}
-        rest_param = [p for p in m.parameters() if id(p) not in visu_ids and id(p) not in text_ids]
+
+        # tách "rest" (không nằm trong visumodel cũng không phải textmodel)
+        rest_names, rest_params = [], []
+        for n, p in m.named_parameters():
+            if (p in visu_param) or n.startswith("textmodel"):
+                continue
+            rest_names.append(n)
+            rest_params.append(p)
 
         # ---- Layer-wise LR decay cho BERT ----
         bert_groups = []
         bert_lr_base = (args.bert_lr if args.bert_lr is not None else args.lr / 10.0)
-        llrd = float(args.bert_llrd)
+        llrd = float(args.bert_llrd) if args.bert_llrd is not None else 0.95
         if hasattr(m.textmodel, "encoder") and hasattr(m.textmodel.encoder, "layer"):
             layers = list(m.textmodel.encoder.layer)
             n_layers = len(layers)
             for li in range(n_layers):
+                layer = layers[li]
                 lr = bert_lr_base * (llrd ** (n_layers - 1 - li))
                 decay, nodecay = [], []
-                for name, param in layers[li].named_parameters():
+                for name, param in layer.named_parameters():
                     full = f"textmodel.encoder.layer.{li}.{name}"
                     (nodecay if _no_decay(full) else decay).append(param)
-                if decay: bert_groups.append({'params': decay, 'lr': lr, 'weight_decay': 1e-4})
-                if nodecay: bert_groups.append({'params': nodecay, 'lr': lr, 'weight_decay': 0.0})
+                if decay:
+                    bert_groups.append({'params': decay, 'lr': lr, 'weight_decay': 1e-4})
+                if nodecay:
+                    bert_groups.append({'params': nodecay, 'lr': lr, 'weight_decay': 0.0})
         else:
+            # fallback nếu không có encoder.layer (model khác BERT chuẩn)
             decay, nodecay = [], []
             for name, param in m.textmodel.named_parameters():
                 (nodecay if _no_decay(name) else decay).append(param)
-            if decay: bert_groups.append({'params': decay, 'lr': bert_lr_base, 'weight_decay': 1e-4})
-            if nodecay: bert_groups.append({'params': nodecay, 'lr': bert_lr_base, 'weight_decay': 0.0})
+            if decay:
+                bert_groups.append({'params': decay, 'lr': bert_lr_base, 'weight_decay': 1e-4})
+            if nodecay:
+                bert_groups.append({'params': nodecay, 'lr': bert_lr_base, 'weight_decay': 0.0})
 
         # visu + rest
         visu_decay, visu_nodecay = [], []
         for name, p in m.visumodel.named_parameters():
             (visu_nodecay if _no_decay(name) else visu_decay).append(p)
         rest_decay, rest_nodecay = [], []
-        for p in rest_param:
-            (rest_nodecay if _no_decay("") else rest_decay).append(p)
+        for name, p in zip(rest_names, rest_params):
+            (rest_nodecay if _no_decay(name) else rest_decay).append(p)
 
         param_groups = []
-        if rest_decay: param_groups.append({'params': rest_decay, 'lr': args.lr, 'weight_decay': 1e-4})
+        if rest_decay:   param_groups.append({'params': rest_decay, 'lr': args.lr, 'weight_decay': 1e-4})
         if rest_nodecay: param_groups.append({'params': rest_nodecay, 'lr': args.lr, 'weight_decay': 0.0})
-        if visu_decay: param_groups.append({'params': visu_decay, 'lr': args.lr / 10.0, 'weight_decay': 1e-4})
+        if visu_decay:   param_groups.append({'params': visu_decay, 'lr': args.lr / 10.0, 'weight_decay': 1e-4})
         if visu_nodecay: param_groups.append({'params': visu_nodecay, 'lr': args.lr / 10.0, 'weight_decay': 0.0})
         param_groups.extend(bert_groups)
 
         opt = torch.optim.AdamW(param_groups, lr=args.lr, weight_decay=1e-4)
         print(f'visu/text/rest params: {sum(p.numel() for p in visu_param)}, '
-              f'{sum(p.numel() for p in text_param)}, '
-              f'{sum(p.numel() for p in rest_param)}')
-        return opt
-
+              f'{sum(p.numel() for p in m.textmodel.parameters())}, '
+              f'{sum(p.numel() for p in rest_params)}')
     else:
-        visu_param = list(m.visumodel.parameters())
-        rest_param = [p for p in m.parameters() if id(p) not in {id(v) for v in visu_param}]
+        visu_param = list(model.module.visumodel.parameters() if isinstance(model, nn.DataParallel) else model.visumodel.parameters())
+        rest_param = [p for p in model.parameters() if p not in visu_param]
         opt = torch.optim.AdamW(
             [{'params': rest_param},
              {'params': visu_param, 'lr': args.lr / 10.0}],
@@ -209,8 +262,7 @@ def optimizer_for(model: nn.Module, args):
         )
         print(f'visu/rest params: {sum(p.numel() for p in visu_param)}, '
               f'{sum(p.numel() for p in rest_param)}')
-        return opt
-
+    return opt
 
 
 def train_epoch(train_loader, model, optimizer, epoch, args, scheduler=None):
