@@ -1,17 +1,6 @@
 # main.py
-import os
-import warnings
-
-# --- Giảm ồn TensorFlow/XLA trong môi trường Kaggle/Colab ---
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
-try:
-    import absl.logging as _absl_logging
-    _absl_logging.set_verbosity(_absl_logging.ERROR)
-except Exception:
-    pass
-warnings.filterwarnings("ignore", message="The parameter 'pretrained' is deprecated")
-
 import argparse
+import os
 import sys
 import time
 import logging
@@ -26,10 +15,7 @@ import torch.nn as nn
 
 from torchvision.transforms import Compose, ToTensor, Normalize
 from torch.utils.data import DataLoader
-from torch.autograd import Variable  # giữ để tương thích, dù không dùng trực tiếp
-
-# ---- schedulers từ HuggingFace cho warmup/decay ----
-from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
+from torch.autograd import Variable
 
 # ---- local imports (refactor) ----
 from dataset import RSVGDataset
@@ -37,9 +23,6 @@ from models.model import MGVLF
 from utils.loss import Reg_Loss, GIoU_Loss
 from utils.utils import AverageMeter, xyxy2xywh, bbox_iou, adjust_learning_rate
 from utils.checkpoint import save_checkpoint, load_pretrain, load_resume
-
-# AMP
-from torch.cuda.amp import autocast, GradScaler
 
 
 def parse_args():
@@ -68,7 +51,7 @@ def parse_args():
     parser.add_argument('--test', dest='test', default=False, action='store_true')
     # model
     parser.add_argument('--bert_model', default='bert-base-uncased', type=str,
-                        help='English BERT checkpoint or local path')
+                        help='English BERT checkpoint')
     parser.add_argument('--device', default='cuda', type=str)
     parser.add_argument('--backbone', default='resnet50', type=str)
     parser.add_argument('--dilation', action='store_true')
@@ -82,25 +65,6 @@ def parse_args():
     parser.add_argument('--nheads', default=8, type=int)
     parser.add_argument('--num_queries', default=441, type=int)  # unused, kept for compatibility
     parser.add_argument('--pre_norm', action='store_true')
-    # performance toggles
-    parser.add_argument('--compile', action='store_true', help='use torch.compile if available')
-    parser.add_argument('--use_torchvision_detr_init', action='store_true', default=False,
-                        help='try to init visual backbone from torchvision DETR weights (if available)')
-    parser.add_argument('--also_init_vl_from_detr', action='store_true', default=False,
-                        help='also try partial init for VL fusion from DETR (non-strict)')
-    # ---- HuggingFace BERT controls ----
-    parser.add_argument('--bert_freeze_layers', type=int, default=0,
-                        help='Freeze n first encoder layers of BERT (0 = no freeze)')
-    parser.add_argument('--bert_lr', type=float, default=None,
-                        help='separate LR for BERT params (default: args.lr/10 if tunebert)')
-    parser.add_argument('--bert_llrd', type=float, default=0.95,
-                        help='Layer-wise LR decay for BERT (e.g., 0.95)')
-    parser.add_argument('--bert_grad_ckpt', action='store_true', default=False,
-                        help='Enable gradient checkpointing for BERT (save VRAM)')
-    parser.add_argument('--sched_warmup_ratio', type=float, default=0.06,
-                        help='Warmup ratio of total steps (e.g., 0.06 = 6%)')
-    parser.add_argument('--sched_type', type=str, default='linear',
-                        choices=['linear', 'cosine'], help='LR scheduler type')
     return parser.parse_args()
 
 
@@ -154,11 +118,9 @@ def build_dataloaders(args):
     )
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
-                              pin_memory=True, drop_last=True, num_workers=args.workers,
-                              persistent_workers=(args.workers > 0))
+                              pin_memory=True, drop_last=True, num_workers=args.workers)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
-                            pin_memory=True, drop_last=True, num_workers=args.workers,
-                            persistent_workers=(args.workers > 0))
+                            pin_memory=True, drop_last=True, num_workers=args.workers)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False,
                              pin_memory=True, drop_last=True, num_workers=0)
 
@@ -167,91 +129,27 @@ def build_dataloaders(args):
 
 
 def build_model(args):
-    model = MGVLF(
-        bert_model=args.bert_model,
-        tunebert=args.tunebert,
-        args=args,
-        use_torchvision_detr_init=args.use_torchvision_detr_init,
-        also_init_vl_from_detr=args.also_init_vl_from_detr
-    )
+    model = MGVLF(bert_model=args.bert_model, tunebert=args.tunebert, args=args)
     model = nn.DataParallel(model) if torch.cuda.device_count() > 1 else model
     device = torch.device('cuda' if torch.cuda.is_available() and args.device.startswith('cuda') else 'cpu')
     model = model.to(device)
-    if args.compile:
-        try:
-            model = torch.compile(model)
-            print("torch.compile enabled.")
-        except Exception as e:
-            print(f"torch.compile skipped: {e}")
     return model
-
-
-def _no_decay(name: str) -> bool:
-    """Helper: quyết định tham số nào không weight decay (bias, LayerNorm)."""
-    nd_list = ["bias", "LayerNorm.weight", "layer_norm.weight", "layernorm.weight"]
-    return any(nd in name for nd in nd_list)
 
 
 def optimizer_for(model: nn.Module, args):
     if args.tunebert:
-        m = model.module if isinstance(model, nn.DataParallel) else model
-        visu_param = list(m.visumodel.parameters())
-
-        # tách "rest" (không nằm trong visumodel cũng không phải textmodel)
-        rest_names, rest_params = [], []
-        for n, p in m.named_parameters():
-            if (p in visu_param) or n.startswith("textmodel"):
-                continue
-            rest_names.append(n)
-            rest_params.append(p)
-
-        # ---- Layer-wise LR decay cho BERT ----
-        bert_groups = []
-        bert_lr_base = (args.bert_lr if args.bert_lr is not None else args.lr / 10.0)
-        llrd = float(args.bert_llrd) if args.bert_llrd is not None else 0.95
-        if hasattr(m.textmodel, "encoder") and hasattr(m.textmodel.encoder, "layer"):
-            layers = list(m.textmodel.encoder.layer)
-            n_layers = len(layers)
-            for li in range(n_layers):
-                layer = layers[li]
-                lr = bert_lr_base * (llrd ** (n_layers - 1 - li))
-                decay, nodecay = [], []
-                for name, param in layer.named_parameters():
-                    full = f"textmodel.encoder.layer.{li}.{name}"
-                    (nodecay if _no_decay(full) else decay).append(param)
-                if decay:
-                    bert_groups.append({'params': decay, 'lr': lr, 'weight_decay': 1e-4})
-                if nodecay:
-                    bert_groups.append({'params': nodecay, 'lr': lr, 'weight_decay': 0.0})
-        else:
-            # fallback nếu không có encoder.layer (model khác BERT chuẩn)
-            decay, nodecay = [], []
-            for name, param in m.textmodel.named_parameters():
-                (nodecay if _no_decay(name) else decay).append(param)
-            if decay:
-                bert_groups.append({'params': decay, 'lr': bert_lr_base, 'weight_decay': 1e-4})
-            if nodecay:
-                bert_groups.append({'params': nodecay, 'lr': bert_lr_base, 'weight_decay': 0.0})
-
-        # visu + rest
-        visu_decay, visu_nodecay = [], []
-        for name, p in m.visumodel.named_parameters():
-            (visu_nodecay if _no_decay(name) else visu_decay).append(p)
-        rest_decay, rest_nodecay = [], []
-        for name, p in zip(rest_names, rest_params):
-            (rest_nodecay if _no_decay(name) else rest_decay).append(p)
-
-        param_groups = []
-        if rest_decay:   param_groups.append({'params': rest_decay, 'lr': args.lr, 'weight_decay': 1e-4})
-        if rest_nodecay: param_groups.append({'params': rest_nodecay, 'lr': args.lr, 'weight_decay': 0.0})
-        if visu_decay:   param_groups.append({'params': visu_decay, 'lr': args.lr / 10.0, 'weight_decay': 1e-4})
-        if visu_nodecay: param_groups.append({'params': visu_nodecay, 'lr': args.lr / 10.0, 'weight_decay': 0.0})
-        param_groups.extend(bert_groups)
-
-        opt = torch.optim.AdamW(param_groups, lr=args.lr, weight_decay=1e-4)
+        visu_param = list(model.module.visumodel.parameters() if isinstance(model, nn.DataParallel) else model.visumodel.parameters())
+        text_param = list(model.module.textmodel.parameters() if isinstance(model, nn.DataParallel) else model.textmodel.parameters())
+        rest_param = [p for p in model.parameters() if all(p is not vp for vp in visu_param) and all(p is not tp for tp in text_param)]
+        opt = torch.optim.AdamW(
+            [{'params': rest_param},
+             {'params': visu_param, 'lr': args.lr / 10.0},
+             {'params': text_param, 'lr': args.lr / 10.0}],
+            lr=args.lr, weight_decay=1e-4
+        )
         print(f'visu/text/rest params: {sum(p.numel() for p in visu_param)}, '
-              f'{sum(p.numel() for p in m.textmodel.parameters())}, '
-              f'{sum(p.numel() for p in rest_params)}')
+              f'{sum(p.numel() for p in text_param)}, '
+              f'{sum(p.numel() for p in rest_param)}')
     else:
         visu_param = list(model.module.visumodel.parameters() if isinstance(model, nn.DataParallel) else model.visumodel.parameters())
         rest_param = [p for p in model.parameters() if p not in visu_param]
@@ -265,7 +163,7 @@ def optimizer_for(model: nn.Module, args):
     return opt
 
 
-def train_epoch(train_loader, model, optimizer, epoch, args, scheduler=None):
+def train_epoch(train_loader, model, optimizer, epoch, args):
     batch_time = AverageMeter()
     losses = AverageMeter()
     l1_losses = AverageMeter()
@@ -277,31 +175,28 @@ def train_epoch(train_loader, model, optimizer, epoch, args, scheduler=None):
     model.train()
     device = next(model.parameters()).device
     end = time.time()
-    scaler = GradScaler(enabled=torch.cuda.is_available())
 
     for batch_idx, (imgs, masks, word_id, word_mask, gt_bbox) in enumerate(train_loader):
         imgs = imgs.to(device)
         masks = masks.to(device)
         masks = masks[:, :, :, 0] == 255  # boolean
-        word_id = torch.as_tensor(word_id, device=device).long()
-        word_mask = torch.as_tensor(word_mask, device=device).long()
+        word_id = torch.as_tensor(word_id, device=device)
+        word_mask = torch.as_tensor(word_mask, device=device)
         gt_bbox = torch.as_tensor(gt_bbox, device=device)
         gt_bbox = torch.clamp(gt_bbox, min=0, max=args.size - 1)
 
-        with autocast(enabled=torch.cuda.is_available()):
-            pred_bbox = model(imgs, masks, word_id, word_mask)  # (B,4)
-            giou_loss = GIoU_Loss(pred_bbox * (args.size - 1), gt_bbox, args.size - 1)
-            gt_bbox_xywh = xyxy2xywh(gt_bbox)
-            l1_loss = Reg_Loss(pred_bbox, gt_bbox_xywh / (args.size - 1))
-            loss = giou_loss + l1_loss
+        pred_bbox = model(imgs, masks, word_id, word_mask)  # (B,4) [cx,cy,w,h] in [0,1] scaled later
 
-        optimizer.zero_grad(set_to_none=True)
-        scaler.scale(loss).backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        scaler.step(optimizer)
-        scaler.update()
-        if scheduler is not None:
-            scheduler.step()
+        # losses
+        loss = 0.0
+        giou_loss = GIoU_Loss(pred_bbox * (args.size - 1), gt_bbox, args.size - 1)
+        gt_bbox_xywh = xyxy2xywh(gt_bbox)
+        l1_loss = Reg_Loss(pred_bbox, gt_bbox_xywh / (args.size - 1))
+        loss = giou_loss + l1_loss
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
         # meters
         losses.update(loss.item(), imgs.size(0))
@@ -329,16 +224,13 @@ def train_epoch(train_loader, model, optimizer, epoch, args, scheduler=None):
         batch_time.update(time.time() - end); end = time.time()
 
         if batch_idx % args.print_freq == 0:
-            # in đủ LR từng param group
-            lr_str = [f"lr[{i}] {g['lr']:.6e}" for i, g in enumerate(optimizer.param_groups)]
             print(f"Epoch[{epoch}] [{batch_idx}/{len(train_loader)}] "
                   f"acc@0.5 {acc5.avg:.4f} | acc@0.6 {acc6.avg:.4f} | acc@0.7 {acc7.avg:.4f} | "
                   f"acc@0.8 {acc8.avg:.4f} | acc@0.9 {acc9.avg:.4f} | "
                   f"mIoU {meanIoU.avg:.4f} | cumIoU {inter_area.sum/ max(1e-6, union_area.sum):.4f} | "
                   f"Loss {losses.avg:.4f} | L1 {l1_losses.avg:.4f} | GIoU {giou_losses.avg:.4f} | "
-                  + " | ".join(lr_str))
-    return (acc5.avg, acc6.avg, acc7.avg, acc8.avg, acc9.avg,
-            meanIoU.avg, inter_area.sum / max(1e-6, union_area.sum), losses.avg)
+                  f"lr_v {optimizer.param_groups[0]['lr']:.6e}")
+    return acc5.avg, acc6.avg, acc7.avg, acc8.avg, acc9.avg, meanIoU.avg, inter_area.sum / max(1e-6, union_area.sum), losses.avg
 
 
 @torch.no_grad()
@@ -357,8 +249,8 @@ def validate_epoch(val_loader, model, args):
         imgs = imgs.to(device)
         masks = masks.to(device)
         masks = masks[:, :, :, 0] == 255
-        word_id = torch.as_tensor(word_id, device=device).long()
-        word_mask = torch.as_tensor(word_mask, device=device).long()
+        word_id = torch.as_tensor(word_id, device=device)
+        word_mask = torch.as_tensor(word_mask, device=device)
         bbox = torch.as_tensor(bbox, device=device)
         bbox = torch.clamp(bbox, min=0, max=args.size - 1)
 
@@ -417,8 +309,8 @@ def test_epoch(test_loader, model, args):
         imgs = imgs.to(device)
         masks = masks.to(device)
         masks = masks[:, :, :, 0] == 255
-        word_id = torch.as_tensor(word_id, device=device).long()
-        word_mask = torch.as_tensor(word_mask, device=device).long()
+        word_id = torch.as_tensor(word_id, device=device)
+        word_mask = torch.as_tensor(word_mask, device=device)
         bbox = torch.as_tensor(bbox, device=device)
         bbox = torch.clamp(bbox, min=0, max=args.size - 1)
 
@@ -426,6 +318,7 @@ def test_epoch(test_loader, model, args):
         pred_xyxy = torch.cat([pred_bbox[:, :2] - (pred_bbox[:, 2:] / 2),
                                pred_bbox[:, :2] + (pred_bbox[:, 2:] / 2)], dim=1) * (args.size - 1)
 
+        # de-letterbox back to original scale if cần (ở đây giữ nguyên metric ở canvas size)
         iou, interA, unionA = bbox_iou(pred_xyxy.detach().cpu(), bbox.detach().cpu(), x1y1x2y2=True)
         cumInter = float(interA.sum().item()); cumUnion = float(unionA.sum().item())
 
@@ -475,16 +368,8 @@ def main():
     if args.resume:
         model = load_resume(model, args, logging)
 
-    # optimizer + scheduler
+    # optimizer
     optimizer = optimizer_for(model, args)
-    scheduler = None
-    if not args.test:
-        total_steps = len(train_loader) * args.nb_epoch
-        warmup_steps = int(total_steps * args.sched_warmup_ratio)
-        if args.sched_type == 'cosine':
-            scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
-        else:
-            scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
     # train / test
     best_accu = -float('inf')
@@ -493,18 +378,15 @@ def main():
         return
 
     for epoch in range(args.nb_epoch):
-        # Nếu dùng scheduler theo batch, KHÔNG gọi adjust_learning_rate theo epoch để tránh xung đột
-        if scheduler is None:
-            adjust_learning_rate(args, optimizer, epoch)
-
-        _ = train_epoch(train_loader, model, optimizer, epoch, args, scheduler)
+        adjust_learning_rate(args, optimizer, epoch)
+        _ = train_epoch(train_loader, model, optimizer, epoch, args)
         accs = validate_epoch(val_loader, model, args)
         acc_new = accs[0]  # acc@0.5
         is_best = acc_new >= best_accu
         best_accu = max(acc_new, best_accu)
         save_checkpoint({
             'epoch': epoch + 1,
-            'state_dict': (model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()),
+            'state_dict': model.state_dict(),
             'best_loss': accs[-1],
             'optimizer': optimizer.state_dict(),
         }, is_best, args, filename=args.savename)

@@ -1,11 +1,9 @@
-# models/model.py
 import os
 from typing import Optional
 
 import torch
 from torch import nn
 from transformers import AutoModel, AutoConfig
-import torchvision
 
 from .CNN_MGVLF import build_VLFusion, build_CNN_MGVLF
 
@@ -15,21 +13,24 @@ def _masked_mean_pool(last_hidden_state: torch.Tensor,
     """
     Mean-pooling theo mask trên chuỗi (B, L, D) -> (B, D).
     """
+    # last_hidden_state: (B, L, D), attention_mask: (B, L)
     mask = attention_mask.unsqueeze(-1).type_as(last_hidden_state)  # (B, L, 1)
-    summed = (last_hidden_state * mask).sum(dim=1)                  # (B, D)
-    denom = mask.sum(dim=1).clamp(min=1e-6)                         # (B, 1)
+    summed = (last_hidden_state * mask).sum(dim=1)                   # (B, D)
+    denom = mask.sum(dim=1).clamp(min=1e-6)                          # (B, 1)
     return summed / denom
 
 
 def _try_load_partial_state_dict(module: nn.Module, sd) -> bool:
     """
     Cố gắng nạp state_dict vào `module` ở chế độ non-strict (partial init).
+    Hỗ trợ cả đường dẫn (dict đã load) lẫn dict trực tiếp.
     """
     try:
         if isinstance(sd, str):
             if not os.path.isfile(sd):
                 return False
             sd = torch.load(sd, map_location="cpu")
+            # cho phép bọc trong khoá 'model'
             if isinstance(sd, dict) and "model" in sd:
                 sd = sd["model"]
 
@@ -49,14 +50,10 @@ def _try_load_partial_state_dict(module: nn.Module, sd) -> bool:
 
 def _try_load_from_torchvision_detr(module: nn.Module) -> bool:
     """
-    Load weight từ DETR ResNet-50 pretrained có sẵn trong torchvision.
+    Load weight từ DETR ResNet-50 pretrained có sẵn trong torchvision,
+    KHÔNG cần file .pth ngoài. Nạp theo non-strict để tận dụng tối đa các lớp trùng tên.
     """
     try:
-        tv_ver = tuple(int(x) for x in torchvision.__version__.split('+')[0].split('.'))
-        if tv_ver < (0, 15, 0):
-            print(f"[INFO] torchvision {torchvision.__version__} < 0.15: skip DETR init.")
-            return False
-
         from torchvision.models.detection import detr_resnet50
         from torchvision.models.detection.detr import Detr_ResNet50_Weights
 
@@ -74,6 +71,17 @@ def _try_load_from_torchvision_detr(module: nn.Module) -> bool:
 class MGVLF(nn.Module):
     """
     Multi-Granularity Visual-Language Fusion model for text-guided localization.
+
+    Pipeline:
+      - Text encoder: BERT (bert-base-uncased mặc định) => token features (B,L,768) + sentence feature (B,768)
+      - Visual encoder: CNN_MGVLF => multi-scale fusion feature (B,256,H',W')
+      - VL Fusion: VLFusion => pooled vector (B,256)
+      - Head: MLP => bbox (cx, cy, w, h) chuẩn hóa trong (-0.5, 1.5) sau khi map
+
+    Điểm khác biệt chính:
+      - Không cần tải thủ công file 'detr-r50-e632da11.pth'.
+        Thay vào đó, ta load trực tiếp pretrained DETR từ torchvision
+        và nạp partial vào các module phù hợp.
     """
 
     def __init__(self,
@@ -82,55 +90,40 @@ class MGVLF(nn.Module):
                  args: Optional[object] = None,
                  use_torchvision_detr_init: bool = True,
                  also_init_vl_from_detr: bool = True):
+        """
+        Args:
+            bert_model: tên model BERT trong HuggingFace.
+            tunebert: có fine-tune BERT hay không.
+            args: cấu hình cho các module vision/VL (được build ở .CNN_MGVLF).
+            use_torchvision_detr_init: nếu True, sẽ lấy weight từ torchvision DETR để init phần nhìn.
+            also_init_vl_from_detr: nếu True, thử nạp partial cả vào VL fusion (an toàn vì non-strict).
+        """
         super().__init__()
 
         self.tunebert = tunebert
 
         # ---- Text encoder (BERT) ----
         self.bert_name = bert_model
-        try:
-            self.bert_config = AutoConfig.from_pretrained(self.bert_name, local_files_only=True)
-            self.textmodel = AutoModel.from_pretrained(self.bert_name, local_files_only=True)
-        except Exception:
-            try:
-                self.bert_config = AutoConfig.from_pretrained(self.bert_name)
-                self.textmodel = AutoModel.from_pretrained(self.bert_name)
-            except Exception as ee:
-                raise RuntimeError(
-                    f"Không thể tải BERT '{self.bert_name}'. "
-                    f"Hãy đặt checkpoint vào thư mục local (vd. /kaggle/input/bert-base-uncased) "
-                    f"và chạy với --bert_model /kaggle/input/bert-base-uncased. Lỗi: {ee}"
-                )
+        self.bert_config = AutoConfig.from_pretrained(self.bert_name)
+        self.textmodel = AutoModel.from_pretrained(self.bert_name)
         self.textdim = getattr(self.bert_config, "hidden_size", 768)
 
         if not self.tunebert:
-            self.textmodel.eval()
             for p in self.textmodel.parameters():
                 p.requires_grad = False
-        else:
-            # Freeze n lớp đầu nếu có yêu cầu
-            n_freeze = int(getattr(args, "bert_freeze_layers", 0) or 0)
-            if n_freeze > 0 and hasattr(self.textmodel, "encoder"):
-                layers = self.textmodel.encoder.layer
-                for li in range(min(n_freeze, len(layers))):
-                    for p in layers[li].parameters():
-                        p.requires_grad = False
-            # Gradient checkpointing
-            if getattr(args, "bert_grad_ckpt", False):
-                if hasattr(self.textmodel, "gradient_checkpointing_enable"):
-                    self.textmodel.gradient_checkpointing_enable()
-                else:
-                    print("[INFO] BERT model does not support gradient_checkpointing_enable().")
 
-        # ---- Visual encoder ----
+        # ---- Visual encoder (CNN+Transformer) ----
         self.visumodel = build_CNN_MGVLF(args)
+
+        # (khuyến nghị) khởi tạo từ torchvision DETR nếu sẵn
         if use_torchvision_detr_init:
             loaded = _try_load_from_torchvision_detr(self.visumodel)
             if not loaded:
                 print("[INFO] Fallback: skip DETR init for visual backbone.")
 
-        # ---- VL fusion ----
+        # ---- VL fusion encoder ----
         self.vlmodel = build_VLFusion(args)
+
         if use_torchvision_detr_init and also_init_vl_from_detr:
             _ = _try_load_from_torchvision_detr(self.vlmodel)
 
@@ -148,13 +141,14 @@ class MGVLF(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def forward(self,
-                image: torch.Tensor,       # (B, 3, H, W)
-                mask: torch.Tensor,        # (B, H, W) bool
+                image: torch.Tensor,       # (B, 3, H, W), normalized
+                mask: torch.Tensor,        # (B, H, W) bool, True = PAD
                 word_id: torch.Tensor,     # (B, L)
                 word_mask: torch.Tensor    # (B, L)
                 ) -> torch.Tensor:
         """
         Trả về: outbox (B, 4) với format (cx, cy, w, h)
+        Sau head: sigmoid * 2 - 0.5 => phạm vi (-0.5, 1.5) cho linh hoạt biên ảnh.
         """
         # ---- Text encoding ----
         outputs = self.textmodel(
@@ -163,31 +157,30 @@ class MGVLF(nn.Module):
             output_hidden_states=True,
             return_dict=True
         )
-        hidden_states = outputs.hidden_states
-        last_hidden_state = outputs.last_hidden_state
-        pooler = getattr(outputs, "pooler_output", None)
+        hidden_states = outputs.hidden_states             # tuple(len=layers+1) of (B,L,D)
+        last_hidden_state = outputs.last_hidden_state     # (B,L,D)
+        pooler = getattr(outputs, "pooler_output", None)  # có thể None
 
         # Sentence feature
         if pooler is None or pooler.numel() == 0:
-            sentence_feature = _masked_mean_pool(last_hidden_state, word_mask)
+            sentence_feature = _masked_mean_pool(last_hidden_state, word_mask)  # (B,D)
         else:
             sentence_feature = pooler
 
         # Token features: trung bình 4 lớp cuối
-        fl = (hidden_states[-1] + hidden_states[-2] +
-              hidden_states[-3] + hidden_states[-4]) / 4.0
+        fl = (hidden_states[-1] + hidden_states[-2] + hidden_states[-3] + hidden_states[-4]) / 4.0
 
         if not self.tunebert:
             fl = fl.detach()
             sentence_feature = sentence_feature.detach()
 
-        # ---- Visual encoder ----
+        # ---- Visual encoder (multi-scale) ----
         fv = self.visumodel(image, mask, word_mask, fl, sentence_feature)  # (B,256,H',W')
 
-        # ---- VL Fusion ----
-        fused = self.vlmodel(fv, fl)  # (B, 256)
+        # ---- VL Fusion (pooled vector) ----
+        fused = self.vlmodel(fv, fl)  # (B, 256) — theo thiết kế của VLFusion
 
         # ---- BBox head ----
-        outbox = self.Prediction_Head(fused)  # (B, 4)
-        outbox = outbox.sigmoid() * 2.0 - 0.5
+        outbox = self.Prediction_Head(fused)     # (B, 4) — (cx, cy, w, h) unbounded
+        outbox = outbox.sigmoid() * 2.0 - 0.5    # map sang (-0.5, 1.5)
         return outbox
