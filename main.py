@@ -20,7 +20,7 @@ from torch.autograd import Variable
 # ---- local imports (refactor) ----
 from dataset import RSVGDataset
 from models.model import MGVLF
-from utils.loss import Reg_Loss, GIoU_Loss
+from utils.loss import Reg_Loss, GIoU_Loss, EIoU_Loss_Compat
 from utils.utils import AverageMeter, xyxy2xywh, bbox_iou, adjust_learning_rate
 from utils.checkpoint import save_checkpoint, load_pretrain, load_resume
 
@@ -129,38 +129,47 @@ def build_dataloaders(args):
 
 
 def build_model(args):
-    model = MGVLF(bert_model=args.bert_model, tunebert=args.tunebert, args=args)
-    model = nn.DataParallel(model) if torch.cuda.device_count() > 1 else model
+    # MGVLF mới: đặt tên tham số theo model.py
+    model = MGVLF(
+        text_model_name=args.bert_model,
+        init_backbone_from_detr=True,
+        freeze_text_encoder=not args.tunebert,  # nếu không tune BERT thì freeze
+        freeze_backbone=False,                  # tuỳ bạn
+        heads=args.nheads,
+        layers=3,                               # theo gợi ý paper (có thể để args.enc_layers nếu muốn)
+        lvfe_iters=3,
+        dropout=args.dropout
+    )
+    if torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model)
     device = torch.device('cuda' if torch.cuda.is_available() and args.device.startswith('cuda') else 'cpu')
     model = model.to(device)
     return model
 
 
+
 def optimizer_for(model: nn.Module, args):
-    if args.tunebert:
-        visu_param = list(model.module.visumodel.parameters() if isinstance(model, nn.DataParallel) else model.visumodel.parameters())
-        text_param = list(model.module.textmodel.parameters() if isinstance(model, nn.DataParallel) else model.textmodel.parameters())
-        rest_param = [p for p in model.parameters() if all(p is not vp for vp in visu_param) and all(p is not tp for tp in text_param)]
-        opt = torch.optim.AdamW(
-            [{'params': rest_param},
-             {'params': visu_param, 'lr': args.lr / 10.0},
-             {'params': text_param, 'lr': args.lr / 10.0}],
-            lr=args.lr, weight_decay=1e-4
-        )
-        print(f'visu/text/rest params: {sum(p.numel() for p in visu_param)}, '
-              f'{sum(p.numel() for p in text_param)}, '
-              f'{sum(p.numel() for p in rest_param)}')
-    else:
-        visu_param = list(model.module.visumodel.parameters() if isinstance(model, nn.DataParallel) else model.visumodel.parameters())
-        rest_param = [p for p in model.parameters() if p not in visu_param]
-        opt = torch.optim.AdamW(
-            [{'params': rest_param},
-             {'params': visu_param, 'lr': args.lr / 10.0}],
-            lr=args.lr, weight_decay=1e-4
-        )
-        print(f'visu/rest params: {sum(p.numel() for p in visu_param)}, '
-              f'{sum(p.numel() for p in rest_param)}')
+    # Lấy module thật nếu DataParallel
+    mm = model.module if isinstance(model, nn.DataParallel) else model
+    # nhóm LR: backbone/text/fusion-head
+    param_groups = mm.get_param_groups(
+        lr_backbone=args.lr / 10.0,
+        lr_text=args.lr / 10.0
+        if args.tunebert
+        else 0.0,  # nếu không tune BERT, lr_text dùng nhưng tham số đã freeze
+        lr_head=args.lr,
+        weight_decay=1e-4,
+    )
+    opt = torch.optim.AdamW(param_groups, lr=args.lr, weight_decay=1e-4)
+
+    # log số lượng tham số mỗi nhóm
+    n0 = sum(p.numel() for p in param_groups[0]["params"])
+    n1 = sum(p.numel() for p in param_groups[1]["params"])
+    n2 = sum(p.numel() for p in param_groups[2]["params"])
+    print(f"groups: backbone={n0} | text={n1} | fusion+head={n2}")
     return opt
+
+
 
 
 def train_epoch(train_loader, model, optimizer, epoch, args):
@@ -185,14 +194,18 @@ def train_epoch(train_loader, model, optimizer, epoch, args):
         gt_bbox = torch.as_tensor(gt_bbox, device=device)
         gt_bbox = torch.clamp(gt_bbox, min=0, max=args.size - 1)
 
-        pred_bbox = model(imgs, masks, word_id, word_mask)  # (B,4) [cx,cy,w,h] in [0,1] scaled later
+        out = model(imgs, input_ids=word_id, attention_mask=word_mask)
+        pred_bbox = out["pred_cxcywh_norm"]  # (B,4) đã chuẩn hoá [0,1]
+
 
         # losses
         loss = 0.0
         giou_loss = GIoU_Loss(pred_bbox * (args.size - 1), gt_bbox, args.size - 1)
         gt_bbox_xywh = xyxy2xywh(gt_bbox)
         l1_loss = Reg_Loss(pred_bbox, gt_bbox_xywh / (args.size - 1))
-        loss = giou_loss + l1_loss
+        loss_eiou = EIoU_Loss_Compat(pred_bbox * (args.size - 1), gt_bbox, args.size - 1)
+
+        loss = giou_loss + l1_loss + loss_eiou
 
         optimizer.zero_grad()
         loss.backward()
@@ -254,10 +267,14 @@ def validate_epoch(val_loader, model, args):
         bbox = torch.as_tensor(bbox, device=device)
         bbox = torch.clamp(bbox, min=0, max=args.size - 1)
 
-        pred_bbox = model(imgs, masks, word_id, word_mask)
+        out = model(imgs, input_ids=word_id, attention_mask=word_mask)
+        pred_bbox = out["pred_cxcywh_norm"]
+
         giou_loss = GIoU_Loss(pred_bbox * (args.size - 1), bbox, args.size - 1)
         l1_loss = Reg_Loss(pred_bbox, xyxy2xywh(bbox) / (args.size - 1))
-        loss = giou_loss + l1_loss
+        loss_eiou = EIoU_Loss_Compat(pred_bbox * (args.size - 1), gt_bbox, args.size - 1)
+
+        loss = giou_loss + l1_loss + loss_eiou
 
         losses.update(loss.item(), imgs.size(0))
         l1_losses.update(l1_loss.item(), imgs.size(0))
@@ -314,7 +331,9 @@ def test_epoch(test_loader, model, args):
         bbox = torch.as_tensor(bbox, device=device)
         bbox = torch.clamp(bbox, min=0, max=args.size - 1)
 
-        pred_bbox = model(imgs, masks, word_id, word_mask)
+        out = model(imgs, input_ids=word_id, attention_mask=word_mask)
+        pred_bbox = out["pred_cxcywh_norm"]
+
         pred_xyxy = torch.cat([pred_bbox[:, :2] - (pred_bbox[:, 2:] / 2),
                                pred_bbox[:, :2] + (pred_bbox[:, 2:] / 2)], dim=1) * (args.size - 1)
 
