@@ -140,7 +140,7 @@ def optimizer_for(model: nn.Module, args):
     if args.tunebert:
         visu_param = list(model.module.visumodel.parameters() if isinstance(model, nn.DataParallel) else model.visumodel.parameters())
         text_param = list(model.module.textmodel.parameters() if isinstance(model, nn.DataParallel) else model.textmodel.parameters())
-        rest_param = [p for p in model.parameters() if (p not in visu_param) and (p not in text_param)]
+        rest_param = [p for p in model.parameters() if all(p is not vp for vp in visu_param) and all(p is not tp for tp in text_param)]
         opt = torch.optim.AdamW(
             [{'params': rest_param},
              {'params': visu_param, 'lr': args.lr / 10.0},
