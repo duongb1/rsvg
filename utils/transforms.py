@@ -10,7 +10,6 @@ import numpy as np
 import torch.nn.functional as F
 from torch.autograd import Variable
 
-
 def letterbox(img: np.ndarray, mask: np.ndarray, height: int,
               color=(123.7, 116.3, 103.5)) -> Tuple[np.ndarray, np.ndarray, float, float, float]:
     """Resize keeping ratio and pad to square (height x height)."""

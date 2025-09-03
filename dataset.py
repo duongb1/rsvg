@@ -9,7 +9,6 @@ from transformers import AutoTokenizer
 
 from utils.transforms import letterbox
 
-
 def filelist(root, file_type):
     return [
         os.path.join(directory_path, f)

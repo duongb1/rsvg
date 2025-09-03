@@ -10,7 +10,6 @@ def masked_mean_pool(last_hidden_state, attention_mask):
     denom = mask.sum(dim=1).clamp(min=1e-6)
     return summed / denom
 
-
 def try_load_partial_state_dict(module: nn.Module, ckpt_url: str, name: str) -> None:
     print(f"[INFO] Downloading and loading checkpoint from {ckpt_url}")
     sd = torch.hub.load_state_dict_from_url(

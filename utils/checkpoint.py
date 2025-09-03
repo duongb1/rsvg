@@ -2,7 +2,6 @@ import os
 import shutil
 import torch
 
-
 def save_checkpoint(state: dict, is_best: bool, args, filename: str = "default"):
     if filename == "default":
         filename = f"MGVLF_batch{args.batch_size}_epoch{args.nb_epoch}_lr{args.lr}_seed{args.seed}"

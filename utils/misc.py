@@ -11,7 +11,6 @@ import torch.distributed as dist
 import torchvision
 from torch import Tensor
 
-
 class SmoothedValue:
     """Track a series of values and provide smoothed stats."""
     def __init__(self, window_size=20, fmt=None):

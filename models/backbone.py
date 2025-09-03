@@ -14,7 +14,6 @@ from torchvision.models._utils import IntermediateLayerGetter
 from utils.misc import NestedTensor
 from .position_encoding import build_position_encoding
 
-
 class FrozenBatchNorm2d(nn.Module):
     """
     BatchNorm2d with fixed (frozen) affine and running stats.

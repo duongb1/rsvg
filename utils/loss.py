@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 
-
 def Reg_Loss(output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """
     Smooth L1 loss on (cx, cy, w, h)

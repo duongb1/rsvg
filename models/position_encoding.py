@@ -11,7 +11,6 @@ from torch import nn
 
 from utils.misc import NestedTensor
 
-
 class PositionEmbeddingSine(nn.Module):
     """
     Standard 2D sine/cos positional encoding, similar to DETR.

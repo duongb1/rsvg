@@ -43,7 +43,7 @@ def parse_args():
     parser.add_argument('--lr', default=1e-4, type=float)
     parser.add_argument('--lr_dec', default=0.1, type=float)
     parser.add_argument('--seed', default=13, type=int)
-    parser.add_argument('--print_freq', default=50, type=int)
+    parser.add_argument('--print_freq', default=100, type=int)
     parser.add_argument('--savename', default='default', type=str)
     parser.add_argument('--resume', default='', type=str, metavar='PATH')
     parser.add_argument('--pretrain', default='', type=str, metavar='PATH')

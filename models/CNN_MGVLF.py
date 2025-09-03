@@ -7,7 +7,6 @@ from .backbone import build_backbone
 from .transformer import build_vis_transformer, build_transformer, build_de
 from .position_encoding import build_position_encoding
 
-
 class CNN_MGVLF(nn.Module):
     """
     Multi-scale CNN encoder + cross-modal decoder to refine the final visual feature map.
