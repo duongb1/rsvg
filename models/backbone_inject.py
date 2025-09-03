@@ -62,7 +62,7 @@ class QABM(nn.Module):
         """Project sentence → vector 2D rồi chiếu vào grid để tạo mask định hướng."""
         B, C, H, W = F.shape
         vec2 = self.dir_mlp(sent_vec)  # (B,2)
-        vec2 = torch.normalize(vec2, dim=-1)  # chuẩn hóa vector
+        vec2 = torch.nn.functional.normalize(vec2, dim=-1)  # chuẩn hóa vector
         grid = self._coord_grid(B, H, W, F.device)  # (B,2,H,W)
         proj = (grid * vec2.unsqueeze(-1).unsqueeze(-1)).sum(dim=1, keepdim=True)  # (B,1,H,W)
         return torch.sigmoid(proj)
