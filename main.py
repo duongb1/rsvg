@@ -43,7 +43,7 @@ def parse_args():
     parser.add_argument('--tunebert', dest='tunebert', default=True, action='store_true')
     parser.add_argument('--test', dest='test', default=False, action='store_true')
     # model
-    parser.add_argument('--bert_model', default='distilbert-base-uncased', type=str)
+    parser.add_argument('--bert_model', default='bert-base-uncased', type=str)
     parser.add_argument('--device', default='cuda', type=str)
     parser.add_argument('--enc_layers', default=4, type=int, help="VLF layers (paper=4)")
     parser.add_argument('--hidden_dim', default=256, type=int)
