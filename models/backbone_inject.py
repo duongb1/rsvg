@@ -103,7 +103,11 @@ class QABM(nn.Module):
             if self.use_direction:
                 di = self._direction_prior(Fi, sent_vec)
                 gi = gi * di
+            # ép kênh nếu internal
+            if self.use_internal_proj:
+                Fi = self.q_proj[i](Fi)
             Fi_mod = (gi * Fi) * (1 + gamma) + beta
             mod_feats.append(Fi_mod)
             gates.append(gi)
+
         return mod_feats, {"gates": gates}
