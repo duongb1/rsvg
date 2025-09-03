@@ -180,6 +180,58 @@ def build_CNN_MGVLF(args, use_qabm=False, qabm_internal=False):
     )
     return model
 
+class VLFusion(nn.Module):
+    """
+    Late fusion of:
+        - Visual tokens pooled (flatten(HxW), project)
+        - Language tokens (B,L,768) -> project
+        - One learned "retrieve" embedding
+
+    Uses a transformer (encoder-only) over the concatenated sequence and returns the
+    last token (retrieve) as fused vector (B, 256).
+    """
+
+    def __init__(self, transformer, pos):
+        super().__init__()
+        self.transformer = transformer
+        self.pos = pos
+        hidden_dim = transformer.d_model
+
+        self.pr = nn.Embedding(1, hidden_dim)   # retrieve token
+        self.v_proj = nn.Sequential(nn.Linear(256, 256), nn.ReLU(inplace=True))
+        self.l_proj = nn.Sequential(nn.Linear(768, 256), nn.ReLU(inplace=True))
+
+    def forward(self, fv, fl):
+        """
+        fv: (B, 256, H, W)
+        fl: (B, L, 768)
+        return: (B, 256) fused vector
+        """
+        bs, c, h, w = fv.shape
+        _, L, _ = fl.shape
+
+        # (B, H*W, 256)
+        pv = fv.view(bs, c, -1).permute(0, 2, 1)
+        pv = self.v_proj(pv)
+
+        # (B, L, 256)
+        pl = self.l_proj(fl)
+
+        # retrieve token
+        pr = self.pr.weight.expand(bs, -1)
+        pr = pr.unsqueeze(1)   # (B, 1, 256)
+
+        # concat sequence: visual + lang + retrieve
+        x0 = torch.cat([pv, pl, pr], dim=1)   # (B, N+L+1, 256)
+
+        # positional encoding
+        pos = self.pos(x0.permute(0, 2, 1)).to(x0.dtype)  # expects (B,C,T)
+        mask = torch.zeros([bs, x0.shape[1]], device=x0.device, dtype=torch.bool)
+
+        memory = self.transformer(x0.permute(0, 2, 1), mask, pos)  # (T,B,C)
+
+        fused = memory[-1]  # retrieve token
+        return fused
 
 def build_VLFusion(args):
     transformer = build_transformer(args)
