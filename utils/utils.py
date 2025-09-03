@@ -5,11 +5,13 @@ class AverageMeter:
     """Computes and stores the average and current value"""
     def __init__(self):
         self.reset()
+
     def reset(self):
         self.val = 0
         self.avg = 0
         self.sum = 0
         self.count = 0
+
     def update(self, val, n=1):
         self.val = val
         self.sum += val * n
@@ -72,17 +74,13 @@ def bbox_iou(box1: torch.Tensor, box2: torch.Tensor, x1y1x2y2=True):
     b1_area = (b1_x2 - b1_x1) * (b1_y2 - b1_y1)
     b2_area = (b2_x2 - b2_x1) * (b2_y2 - b2_y1)
     union_area = b1_area + b2_area - inter_area
-    return inter_area / (union_area + 1e-16), inter_area, union_area
+    union_area = torch.clamp(union_area, min=1e-6)
+    return inter_area / union_area, inter_area, union_area
 
 
-def adjust_learning_rate(args, optimizer, epoch: int):
-    """
-    Simple step scheduler: after epoch >= 60, multiply base LR by args.lr_dec.
-    Keeps group[1], group[2] at 0.1x of base (for visual/text if present).
-    """
-    base_lr = args.lr * (args.lr_dec if epoch >= 60 else 1.0)
-    optimizer.param_groups[0]['lr'] = base_lr
-    if len(optimizer.param_groups) > 1:
-        optimizer.param_groups[1]['lr'] = base_lr / 10.0
-    if len(optimizer.param_groups) > 2:
-        optimizer.param_groups[2]['lr'] = base_lr / 10.0
+def adjust_learning_rate(args, optimizer, epoch):
+    """Reduce LR after 60 epochs (paper setting)."""
+    lr_decay = getattr(args, "lr_dec", 0.1)
+    if epoch == 60:
+        for param_group in optimizer.param_groups:
+            param_group["lr"] *= lr_decay
