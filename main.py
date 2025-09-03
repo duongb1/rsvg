@@ -236,7 +236,8 @@ def validate_epoch(val_loader, model, args):
         bbox = torch.as_tensor(bbox, device=device)
         bbox = torch.clamp(bbox, min=0, max=args.size - 1)
 
-        pred_bbox = model(imgs, input_ids=word_id, attention_mask=word_mask)
+        pred_bbox_dict = model(imgs, input_ids=word_id, attention_mask=word_mask)
+        pred_bbox = pred_bbox_dict["pred_cxcywh_norm"]
 
         giou_loss = GIoU_Loss(pred_bbox * (args.size - 1), bbox, args.size - 1)
         l1_loss = Reg_Loss(pred_bbox, xyxy2xywh(bbox) / (args.size - 1))
@@ -250,7 +251,7 @@ def validate_epoch(val_loader, model, args):
         eiou_losses.update(eiou_loss.item(), bsz)
 
         pred_xyxy = torch.cat([pred_bbox[:, :2] - (pred_bbox[:, 2:] / 2),
-                               pred_bbox[:, :2] + (pred_bbox[:, 2:] / 2)], dim=1) * (args.size - 1)
+                    pred_bbox[:, :2] + (pred_bbox[:, 2:] / 2)], dim=1) * (args.size - 1)
         iou, interA, unionA = bbox_iou(pred_xyxy.detach().cpu(), bbox.detach().cpu(), x1y1x2y2=True)
 
         cumInter = float(interA.sum().item())
@@ -298,9 +299,10 @@ def test_epoch(test_loader, model, args):
         bbox = torch.as_tensor(bbox, device=device)
         bbox = torch.clamp(bbox, min=0, max=args.size - 1)
 
-        pred_bbox = model(imgs, input_ids=word_id, attention_mask=word_mask)
+        pred_bbox_dict = model(imgs, input_ids=word_id, attention_mask=word_mask)
+        pred_bbox = pred_bbox_dict["pred_cxcywh_norm"]
         pred_xyxy = torch.cat([pred_bbox[:, :2] - (pred_bbox[:, 2:] / 2),
-                               pred_bbox[:, :2] + (pred_bbox[:, 2:] / 2)], dim=1) * (args.size - 1)
+                              pred_bbox[:, :2] + (pred_bbox[:, 2:] / 2)], dim=1) * (args.size - 1)
 
         iou, interA, unionA = bbox_iou(pred_xyxy.detach().cpu(), bbox.detach().cpu(), x1y1x2y2=True)
         cumInter = float(interA.sum().item()); cumUnion = float(unionA.sum().item())
