@@ -25,7 +25,7 @@ class CNN_MGVLF(nn.Module):
         - refineFeature: (B, 256, H4, W4)   # feature at 1/32 scale (from resnet layer4) refined by DE + EN
     """
 
-    def __init__(self, backbone, transformer, DE, position_encoding, max_txt_len: int = 40, hidden_dim: int = 256):
+    def __init__(self, backbone, transformer, DE, position_encoding, max_txt_len: int = 40, hidden_dim: int = 256, use_qabm: bool = False):
         super().__init__()
         self.backbone = backbone
         self.transformer = transformer      # visual-only transformer encoder (returns (B,256,H,W))
@@ -223,7 +223,8 @@ class VLFusion(nn.Module):
         return fused
 
 
-def build_CNN_MGVLF(args):
+def build_CNN_MGVLF(args, use_qabm: bool = False):
+
     """
     Factory: visual encoder with cross-modal decode + visual transformer refine.
     """
@@ -239,7 +240,7 @@ def build_CNN_MGVLF(args):
     position_encoding=pos,
     max_txt_len=getattr(args, "time", 40),
     hidden_dim=getattr(args, "hidden_dim", 256),
-    use_qabm=getattr(args, "use_qabm", False)
+    use_qabm = use_qabm
     )
     return model
 
