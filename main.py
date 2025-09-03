@@ -65,6 +65,8 @@ def parse_args():
     parser.add_argument('--nheads', default=8, type=int)
     parser.add_argument('--num_queries', default=441, type=int)  # unused, kept for compatibility
     parser.add_argument('--pre_norm', action='store_true')
+    parser.add_argument('--use_qabm', action='store_true', help='inject QABM into backbone')
+
     return parser.parse_args()
 
 

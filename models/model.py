@@ -2,7 +2,7 @@ import torch
 from torch import nn
 from transformers import AutoModel, AutoConfig
 from .CNN_MGVLF import build_VLFusion, build_CNN_MGVLF
-
+from .backbone_inject import QABM
 
 def masked_mean_pool(last_hidden_state, attention_mask):
     mask = attention_mask.unsqueeze(-1).type_as(last_hidden_state)
@@ -50,7 +50,7 @@ class MGVLF(nn.Module):
                 p.requires_grad = False
 
         # ---- Visual encoder ----
-        self.visumodel = build_CNN_MGVLF(args)
+        self.visumodel = build_CNN_MGVLF(args, use_qabm=getattr(args, "use_qabm", False))
         try_load_partial_state_dict(self.visumodel, detr_ckpt_url, "visumodel")
 
         # ---- VL fusion ----

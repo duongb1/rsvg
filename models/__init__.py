@@ -13,6 +13,8 @@ from .CNN_MGVLF import build_CNN_MGVLF, build_VLFusion
 from .backbone import build_backbone
 from .transformer import build_vis_transformer, build_transformer, build_de
 
+from .backbone_inject import QABM
+
 __all__ = [
     "MGVLF",
     "build_CNN_MGVLF",
@@ -21,4 +23,5 @@ __all__ = [
     "build_vis_transformer",
     "build_transformer",
     "build_de",
+    "QABM",   # thêm vào đây
 ]

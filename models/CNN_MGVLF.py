@@ -6,6 +6,9 @@ from utils.misc import NestedTensor
 from .backbone import build_backbone
 from .transformer import build_vis_transformer, build_transformer, build_de
 from .position_encoding import build_position_encoding
+from .backbone_inject import QABM
+
+
 
 class CNN_MGVLF(nn.Module):
     """
@@ -29,6 +32,10 @@ class CNN_MGVLF(nn.Module):
         self.DE = DE                        # one-layer cross-decoder to inject text into deepest visual tokens
         self.pos = position_encoding
         self.hidden_dim = hidden_dim
+        # QABM optional
+        self.use_qabm = use_qabm
+        if self.use_qabm:
+            self.qabm = QABM(c_vis=hidden_dim, d_txt=768, use_direction=True)
 
         # text positions for (max_txt_len + 1 [sentence token])
         self.text_pos_embed = nn.Embedding(max_txt_len + 1, hidden_dim)
@@ -67,6 +74,14 @@ class CNN_MGVLF(nn.Module):
 
         # we use deepest visual map (layer4) as base
         featureMap4, mask4 = features[3].decompose()     # (B, C=2048, H4, W4), (B, H4, W4)
+        # Nếu bật QABM
+        if self.use_qabm:
+            # chuẩn hóa input text
+            word_mask = word_mask if word_mask is not None else None
+            feats = [f.tensors for f in features]  # lấy tensor (B,C,H,W)
+            feats_mod, aux = self.qabm(feats, wordFeature, sentenceFeature, word_mask)
+            # thay thế featureMap4 bằng bản đã mod
+            featureMap4 = feats_mod[-1]
         bs, _, h, w = featureMap4.shape
 
         # 2) Create a feature pyramid by further striding after layer4
@@ -218,12 +233,13 @@ def build_CNN_MGVLF(args):
     pos = build_position_encoding(args, position_embedding='sine')
 
     model = CNN_MGVLF(
-        backbone=backbone,
-        transformer=EN,
-        DE=DE,
-        position_encoding=pos,
-        max_txt_len=getattr(args, "time", 40),
-        hidden_dim=getattr(args, "hidden_dim", 256)
+    backbone=backbone,
+    transformer=EN,
+    DE=DE,
+    position_encoding=pos,
+    max_txt_len=getattr(args, "time", 40),
+    hidden_dim=getattr(args, "hidden_dim", 256),
+    use_qabm=getattr(args, "use_qabm", False)
     )
     return model
 
