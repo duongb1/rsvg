@@ -52,6 +52,14 @@ class CNN_MGVLF(nn.Module):
         self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
         # project language hidden into transformer width
         self.l_proj = nn.Sequential(nn.Linear(768, hidden_dim), nn.ReLU(inplace=True))
+        # project backbone features (layer1=256, layer2=512, layer3=1024, layer4=2048) về hidden_dim=256
+        self.stage_projs = nn.ModuleList([
+            nn.Conv2d(256, hidden_dim, kernel_size=1),   # layer1
+            nn.Conv2d(512, hidden_dim, kernel_size=1),   # layer2
+            nn.Conv2d(1024, hidden_dim, kernel_size=1),  # layer3
+            nn.Conv2d(2048, hidden_dim, kernel_size=1),  # layer4
+        ])
+
 
     @staticmethod
     def _resize_mask(next_feature_map: torch.Tensor, prev_mask: torch.Tensor) -> torch.Tensor:
@@ -71,6 +79,9 @@ class CNN_MGVLF(nn.Module):
         # 1) Backbone multi-layer features + sine pos for each map
         samples = NestedTensor(img, mask)
         features, pos_list = self.backbone(samples)  # list of NestedTensor for layer1..layer4; pos_list aligned
+        # ép kênh backbone -> 256 để đưa vào QABM
+        feats = [proj(f.tensors) for proj, f in zip(self.stage_projs, features)]
+        feats_mod, aux = self.qabm(feats, wordFeature, sentenceFeature, word_mask)
 
         # we use deepest visual map (layer4) as base
         featureMap4, mask4 = features[3].decompose()     # (B, C=2048, H4, W4), (B, H4, W4)
