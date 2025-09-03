@@ -92,15 +92,18 @@ def build_dataloaders(args):
 def build_model(args):
     model = MGVLF(
         text_model_name=args.bert_model,
+        freeze_text_encoder=not args.tunebert,
+        freeze_backbone=False,
+        v_dim=args.hidden_dim,
         heads=args.nheads,
-        layers=args.enc_layers,  # VLF layers
-        lvfe_iters=3,            # LVFE stacks = 3 theo paper
+        lvfe_layers=3,          # theo paper
+        vlf_layers=4,           # theo paper
+        vlf_query_repeats=4,
         dropout=args.dropout,
-        freeze_text_encoder=not args.tunebert
     )
     if torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
-    device = torch.device('cuda' if torch.cuda.is_available() and args.device.startswith('cuda') else 'cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     return model.to(device)
 
 
