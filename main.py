@@ -164,7 +164,8 @@ def train_epoch(train_loader, model, optimizer, epoch, args):
         gt_bbox = torch.clamp(gt_bbox, min=0, max=args.size - 1)
 
         # forward
-        pred_bbox = model(imgs, input_ids=word_id, attention_mask=word_mask)  # (B,4) normalized [0,1]
+        pred_bbox_dict = model(imgs, input_ids=word_id, attention_mask=word_mask)
+        pred_bbox = pred_bbox_dict["pred_cxcywh_norm"]  # (B,4) normalized [0,1]
 
         # losses
         giou_loss = GIoU_Loss(pred_bbox * (args.size - 1), gt_bbox, args.size - 1)
