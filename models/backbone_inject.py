@@ -25,6 +25,14 @@ class QABM(nn.Module):
         self.beta_mlp  = nn.Sequential(nn.Linear(d_txt, out_dim), nn.ReLU(), nn.Linear(out_dim, out_dim))
         if use_direction:
             self.dir_mlp = nn.Sequential(nn.Linear(d_txt, out_dim // 4), nn.ReLU(), nn.Linear(out_dim // 4, 2))
+        def _direction_prior(self, F: torch.Tensor, sent_vec: torch.Tensor) -> torch.Tensor:
+            """Project sentence to a 2D direction vector and align with coord grid -> (B,1,H,W) in (0,1)."""
+            B, C, H, W = F.shape
+            vec2 = self.dir_mlp(sent_vec)  # (B,2)
+            vec2 = torch.nn.functional.normalize(vec2, dim=-1)
+            grid = self._coord_grid(B, H, W, F.device)  # (B,2,H,W)
+            proj = (grid * vec2.unsqueeze(-1).unsqueeze(-1)).sum(dim=1, keepdim=True)  # (B,1,H,W)
+            return torch.sigmoid(proj)  # (B,1,H,W)
 
     def _spatial_gate(self, idx, F, T, attn_mask):
         B, _, H, W = F.shape
