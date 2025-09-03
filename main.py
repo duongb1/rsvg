@@ -65,7 +65,11 @@ def parse_args():
     parser.add_argument('--nheads', default=8, type=int)
     parser.add_argument('--num_queries', default=441, type=int)  # unused, kept for compatibility
     parser.add_argument('--pre_norm', action='store_true')
-    parser.add_argument('--use_qabm', action='store_true', help='inject QABM into backbone')
+    parser.add_argument("--use_qabm", action="store_true",
+                    help="Enable Query-Aware Backbone Modulator (QABM)")
+    parser.add_argument("--qabm_internal", action="store_true",
+                    help="Let QABM handle channel projection internally")
+
 
     return parser.parse_args()
 

@@ -50,8 +50,13 @@ class MGVLF(nn.Module):
                 p.requires_grad = False
 
         # ---- Visual encoder ----
-        self.visumodel = build_CNN_MGVLF(args, use_qabm=getattr(args, "use_qabm", False))
+        self.visumodel = build_CNN_MGVLF(
+            args,
+            use_qabm=getattr(args, "use_qabm", False),
+            qabm_internal=getattr(args, "qabm_internal", False)
+        )
         try_load_partial_state_dict(self.visumodel, detr_ckpt_url, "visumodel")
+
 
         # ---- VL fusion ----
         self.vlmodel = build_VLFusion(args)
