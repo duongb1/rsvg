@@ -1,7 +1,6 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
+# main.py
 """
-Train + Validate for MGVLF
+Train + Validate for MGVLF (all-in-one baseline+improve)
 """
 import argparse
 import os, sys, time, datetime, logging, random
@@ -20,9 +19,11 @@ from torchvision.transforms import Compose, ToTensor, Normalize
 
 from data_loader import RSVGDataset
 from models.model import MGVLF
-from utils.loss import Reg_Loss, GIoU_Loss
-from utils.utils import AverageMeter, xyxy2xywh, bbox_iou, adjust_learning_rate
+from utils.loss import Reg_Loss, GIoU_Loss, bbox_xywh_to_xyxy, iou_xyxy, quality_loss
+from utils.utils import AverageMeter, xyxy2xywh, bbox_iou  # adjust_learning_rate không dùng nữa
 from utils.checkpoint import save_checkpoint, load_pretrain, load_resume
+from utils.schedule import WarmupCosine
+from utils.ema import EMA
 
 
 def parse_args():
@@ -35,7 +36,7 @@ def parse_args():
     parser.add_argument('--workers', default=0, type=int)
     parser.add_argument('--nb_epoch', default=150, type=int)
     parser.add_argument('--lr', default=1e-4, type=float)
-    parser.add_argument('--lr_dec', default=0.1, type=float)
+    parser.add_argument('--lr_dec', default=0.1, type=float)  # giữ để tương thích log, không dùng
     parser.add_argument('--batch_size', default=10, type=int)
     parser.add_argument('--resume', default='', type=str, metavar='PATH')
     parser.add_argument('--pretrain', default='', type=str, metavar='PATH')
@@ -60,6 +61,13 @@ def parse_args():
     parser.add_argument('--nheads', default=8, type=int)
     parser.add_argument('--num_queries', default=400 + 40 + 1, type=int)
     parser.add_argument('--pre_norm', action='store_true')
+
+    # ===== Improvements (all-in-one) =====
+    parser.add_argument('--use_ema', action='store_true', help='Use EMA for eval')
+    parser.add_argument('--num_retrieval', type=int, default=4, help='K retrieval tokens pooled at fusion output')
+    parser.add_argument('--use_coord', action='store_true', help='Inject 8-ch coord prior into visual feature')
+    # parser.add_argument('--prune_ratio', type=float, default=1.0)  # để sau
+
     return parser.parse_args()
 
 
@@ -98,17 +106,12 @@ def build_model(args):
 
     # ==== group params (SO SÁNH THEO IDENTITY) ====
     if args.tunebert:
-        # Lấy list ngay từ đầu để có object identity ổn định
         visu_param = list(model.module.visumodel.parameters())
         text_param = list(model.module.textmodel.parameters())
-
         visu_ids = {id(p) for p in visu_param}
         text_ids = {id(p) for p in text_param}
-
-        # phần còn lại = tất cả trừ 2 nhóm trên (theo id)
         rest_param = [p for p in model.parameters() if id(p) not in visu_ids and id(p) not in text_ids]
 
-        # (tuỳ chọn) chỉ lấy params trainable
         visu_param = [p for p in visu_param if p.requires_grad]
         text_param = [p for p in text_param if p.requires_grad]
         rest_param = [p for p in rest_param if p.requires_grad]
@@ -119,19 +122,16 @@ def build_model(args):
                 {'params': visu_param, 'lr': args.lr / 10.0},
                 {'params': text_param, 'lr': args.lr / 10.0},
             ],
-            lr=args.lr, weight_decay=1e-4
+            lr=args.lr, weight_decay=3e-4
         )
 
         sum_visu = sum(p.nelement() for p in visu_param)
         sum_text = sum(p.nelement() for p in text_param)
         sum_rest = sum(p.nelement() for p in rest_param)
         print('visu, text, fusion module parameters:', sum_visu, sum_text, sum_rest)
-
     else:
-        # Không tune BERT: có thể freeze text model (đã set trong MGVLF) hoặc để nguyên
         visu_param = list(model.module.visumodel.parameters())
         visu_ids = {id(p) for p in visu_param}
-
         rest_param = [p for p in model.parameters() if id(p) not in visu_ids]
 
         visu_param = [p for p in visu_param if p.requires_grad]
@@ -142,14 +142,12 @@ def build_model(args):
                 {'params': rest_param, 'lr': args.lr},
                 {'params': visu_param, 'lr': args.lr},
             ],
-            lr=args.lr, weight_decay=1e-4
+            lr=args.lr, weight_decay=3e-4
         )
 
         sum_visu = sum(p.nelement() for p in visu_param)
         sum_text_total = sum(p.nelement() for p in model.module.textmodel.parameters())
         sum_rest = sum(p.nelement() for p in rest_param)
-        # fusion ~ rest; nếu text bị freeze, nó nằm trong rest về mặt tổng số param ALL,
-        # nhưng không ảnh hưởng training vì requires_grad=False sẽ không vào optimizer.
         print('visu, text(total), fusion(rest) parameters:', sum_visu, sum_text_total, sum_rest)
 
     # ==== sanity checks để tránh sót/đúp ====
@@ -158,15 +156,12 @@ def build_model(args):
     for g in optimizer.param_groups:
         for p in g['params']:
             grouped_ids.add(id(p))
-
-    assert all_ids == grouped_ids, \
-        f"Param grouping mismatch: all_grad={len(all_ids)} grouped={len(grouped_ids)}"
+    assert all_ids == grouped_ids, f"Param grouping mismatch: all_grad={len(all_ids)} grouped={len(grouped_ids)}"
 
     return model, optimizer
 
 
-
-def train_epoch(train_loader, model, optimizer, epoch, args):
+def train_epoch(train_loader, model, optimizer, epoch, args, sched=None, ema=None):
     batch_time = AverageMeter()
     losses = AverageMeter()
     l1_losses = AverageMeter()
@@ -178,12 +173,14 @@ def train_epoch(train_loader, model, optimizer, epoch, args):
     end = time.time()
 
     for batch_idx, (imgs, masks, word_id, word_mask, gt_bbox) in enumerate(train_loader):
-        imgs = imgs.cuda()
-        masks = masks.cuda()
-        masks = (masks[:, :, :, 0] == 255).bool()       # True = padding
-        word_id = word_id.cuda()
-        word_mask = word_mask.cuda()
-        gt_bbox = gt_bbox.cuda()
+        imgs = imgs.cuda(non_blocking=True)
+        masks = masks.cuda(non_blocking=True)
+        # True = padding
+        masks = (masks[:, :, :, 0] == 255).bool()
+        word_id = word_id.cuda(non_blocking=True)
+        word_mask = word_mask.cuda(non_blocking=True)
+        gt_bbox = gt_bbox.cuda(non_blocking=True)
+
         image = Variable(imgs)
         masks = Variable(masks)
         word_id = Variable(word_id)
@@ -191,27 +188,47 @@ def train_epoch(train_loader, model, optimizer, epoch, args):
         gt_bbox = Variable(gt_bbox)
         gt_bbox = torch.clamp(gt_bbox, min=0, max=args.size - 1)
 
-        pred_bbox = model(image, masks, word_id, word_mask)
+        # forward + aux (qhat)
+        pred_bbox, aux = model(image, masks, word_id, word_mask, return_aux=True)
+        qhat = aux["qhat"]  # (B,1) in [0,1]
 
-        # loss
-        loss = 0.
+        # --- losses ---
+        # GIoU dùng pixel
         giou = GIoU_Loss(pred_bbox * (args.size - 1), gt_bbox, args.size - 1)
-        loss += giou
-        gt_bbox_ = xyxy2xywh(gt_bbox)
-        l1 = Reg_Loss(pred_bbox, gt_bbox_ / (args.size - 1))
-        loss += l1
+        # L1 dùng norm (giữ như code gốc)
+        gt_bbox_xywh = xyxy2xywh(gt_bbox)
+        l1 = Reg_Loss(pred_bbox, gt_bbox_xywh / (args.size - 1))
 
-        optimizer.zero_grad()
+        # IoU target cho quality head & weighting — dùng NORM hệ (cùng hệ với L1)
+        pred_xyxy_norm = bbox_xywh_to_xyxy(pred_bbox)                  # (B,4) norm
+        gt_xyxy_norm   = bbox_xywh_to_xyxy(gt_bbox_xywh / (args.size - 1))
+        with torch.no_grad():
+            iou_t = iou_xyxy(pred_xyxy_norm, gt_xyxy_norm)            # (B,1)
+
+        # trọng số chất lượng nhẹ
+        qw = (iou_t + 0.5)  # ∈ [0.5, 1.5]
+        main_loss = (l1 + giou) * qw.mean()
+        q_loss = quality_loss(qhat, iou_t, weight=0.2)
+
+        loss = main_loss + q_loss
+
+        optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
+        if sched is not None:
+            sched.step()
+        if ema is not None:
+            ema.update(model)
+
+        # logging loss
         losses.update(loss.item(), imgs.size(0))
         l1_losses.update(l1.item(), imgs.size(0))
         GIoU_losses.update(giou.item(), imgs.size(0))
 
-        # metrics
-        pred_xyxy = torch.cat([pred_bbox[:, :2] - (pred_bbox[:, 2:] / 2),
-                               pred_bbox[:, :2] + (pred_bbox[:, 2:] / 2)], dim=1) * (args.size - 1)
-        iou, interArea, unionArea = bbox_iou(pred_xyxy.data.cpu(), gt_bbox.data.cpu(), x1y1x2y2=True)
+        # ---- metrics (giữ nguyên logic cũ) ----
+        pred_xyxy_px = torch.cat([pred_bbox[:, :2] - (pred_bbox[:, 2:] / 2),
+                                  pred_bbox[:, :2] + (pred_bbox[:, 2:] / 2)], dim=1) * (args.size - 1)
+        iou, interArea, unionArea = bbox_iou(pred_xyxy_px.data.cpu(), gt_bbox.data.cpu(), x1y1x2y2=True)
         cumInterArea = np.sum(np.array(interArea.data.cpu().numpy()))
         cumUnionArea = np.sum(np.array(unionArea.data.cpu().numpy()))
         accu5 = np.mean((iou.data.cpu().numpy() > 0.5).astype(float))
@@ -230,47 +247,59 @@ def train_epoch(train_loader, model, optimizer, epoch, args):
         end = time.time()
 
         if batch_idx % args.print_freq == 0:
-            lang_lr = optimizer.param_groups[2]['lr'] if len(optimizer.param_groups) > 2 else optimizer.param_groups[-1]['lr']
+            # nếu có 3 nhóm param, nhóm thứ 3 thường là text
+            try:
+                lang_lr = optimizer.param_groups[2]['lr']
+            except Exception:
+                lang_lr = optimizer.param_groups[-1]['lr']
             print_str = (f'Epoch: [{epoch}][{batch_idx}/{len(train_loader)}]\t'
                          f'acc@0.5: {acc5.avg:.4f}\tacc@0.6: {acc6.avg:.4f}\tacc@0.7: {acc7.avg:.4f}\t'
                          f'acc@0.8: {acc8.avg:.4f}\tacc@0.9: {acc9.avg:.4f}\t'
                          f'meanIoU: {meanIoU.avg:.4f}\t'
                          f'cumuIoU: {inter_area.sum/union_area.sum:.4f}\t'
                          f'Loss: {losses.avg:.4f}\tL1: {l1_losses.avg:.4f}\tGIoU: {GIoU_losses.avg:.4f}\t'
-                         f'vis_lr {optimizer.param_groups[0]["lr"]:.8f}\tlang_lr {lang_lr:.8f}')
+                         f'vis_lr {optimizer.param_groups[0][\"lr\"]:.8f}\tlang_lr {lang_lr:.8f}')
             print(print_str); logging.info(print_str)
 
     return acc5.avg, acc6.avg, acc7.avg, acc8.avg, acc9.avg, meanIoU.avg, inter_area.sum/union_area.sum, losses.avg
 
 
 @torch.no_grad()
-def validate_epoch(val_loader, model, args):
+def validate_epoch(val_loader, model, args, ema_obj=None):
     batch_time = AverageMeter()
     losses = AverageMeter(); l1_losses = AverageMeter(); GIoU_losses = AverageMeter()
     acc5 = AverageMeter(); acc6 = AverageMeter(); acc7 = AverageMeter(); acc8 = AverageMeter(); acc9 = AverageMeter()
     meanIoU = AverageMeter(); inter_area = AverageMeter(); union_area = AverageMeter()
 
-    model.eval()
+    # dùng EMA nếu có
+    eval_model = ema_obj.ema if (ema_obj is not None) else model
+    eval_model.eval()
+
     end = time.time()
     print(datetime.datetime.now())
 
     for batch_idx, (imgs, masks, word_id, word_mask, bbox) in enumerate(val_loader):
-        imgs = imgs.cuda()
-        masks = masks.cuda()
+        imgs = imgs.cuda(non_blocking=True)
+        masks = masks.cuda(non_blocking=True)
         masks = (masks[:, :, :, 0] == 255).bool()      # True = padding
-        word_id = word_id.cuda()
-        word_mask = word_mask.cuda()
-        bbox = bbox.cuda()
+        word_id = word_id.cuda(non_blocking=True)
+        word_mask = word_mask.cuda(non_blocking=True)
+        bbox = bbox.cuda(non_blocking=True)
 
         image = Variable(imgs); masks = Variable(masks)
         word_id = Variable(word_id); word_mask = Variable(word_mask)
         bbox = Variable(bbox)
         bbox = torch.clamp(bbox, min=0, max=args.size - 1)
-
-        pred_bbox = model(image, masks, word_id, word_mask)
         gt_bbox = bbox
 
-        # loss
+        # ---- TTA: pred gốc + flip ngang ----
+        pred1 = eval_model(image, masks, word_id, word_mask)             # (B,4)
+        image_flip = torch.flip(image, dims=[-1])
+        pred2 = eval_model(image_flip, masks, word_id, word_mask)
+        pred2[:, 0] = 1.0 - pred2[:, 0]  # cx -> 1 - cx
+        pred_bbox = 0.5 * (pred1 + pred2)
+
+        # ---- loss (để theo dõi, không tối ưu) ----
         loss = 0.
         giou = GIoU_Loss(pred_bbox * (args.size - 1), gt_bbox, args.size - 1); loss += giou
         gt_bbox_ = xyxy2xywh(gt_bbox)
@@ -278,7 +307,7 @@ def validate_epoch(val_loader, model, args):
 
         losses.update(loss.item(), imgs.size(0)); l1_losses.update(l1.item(), imgs.size(0)); GIoU_losses.update(giou.item(), imgs.size(0))
 
-        # metrics
+        # ---- metrics (giữ như cũ) ----
         pred_xyxy = torch.cat([pred_bbox[:, :2] - (pred_bbox[:, 2:] / 2),
                                pred_bbox[:, :2] + (pred_bbox[:, 2:] / 2)], dim=1) * (args.size - 1)
         iou, interArea, unionArea = bbox_iou(pred_xyxy.data.cpu(), gt_bbox.data.cpu(), x1y1x2y2=True)
@@ -341,12 +370,19 @@ def main():
     train_loader, val_loader = build_loaders(args)
     model, optimizer = build_model(args)
 
+    # ===== Scheduler (Warmup→Cosine) & EMA =====
+    steps_per_epoch = len(train_loader)
+    total_steps = args.nb_epoch * max(1, steps_per_epoch)
+    warmup_steps = max(100, int(0.02 * total_steps))  # ~2%
+    sched = WarmupCosine(optimizer, base_lr=args.lr, warmup_steps=warmup_steps, total_steps=total_steps)
+    ema = EMA(model, decay=0.999) if args.use_ema else None
+
     # train loop
     best_accu = -float('Inf')
+    global_step = 0
     for epoch in range(args.nb_epoch):
-        adjust_learning_rate(args, optimizer, epoch)
-        _ = train_epoch(train_loader, model, optimizer, epoch, args)
-        v_metrics = validate_epoch(val_loader, model, args)
+        _ = train_epoch(train_loader, model, optimizer, epoch, args, sched=sched, ema=ema)
+        v_metrics = validate_epoch(val_loader, model, args, ema_obj=ema if args.use_ema else None)
 
         acc_new = v_metrics[0]
         is_best = acc_new >= best_accu
