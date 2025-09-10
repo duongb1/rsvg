@@ -258,7 +258,7 @@ def train_epoch(train_loader, model, optimizer, epoch, args, sched=None, ema=Non
                          f'meanIoU: {meanIoU.avg:.4f}\t'
                          f'cumuIoU: {inter_area.sum/union_area.sum:.4f}\t'
                          f'Loss: {losses.avg:.4f}\tL1: {l1_losses.avg:.4f}\tGIoU: {GIoU_losses.avg:.4f}\t'
-                         f'vis_lr {optimizer.param_groups[0]["lr"]:.8f}\tlang_lr {lang_lr:.8f}'
+                         f'vis_lr {optimizer.param_groups[0]["lr"]:.8f}\tlang_lr {lang_lr:.8f}')
 
             print(print_str); logging.info(print_str)
 
