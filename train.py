@@ -92,8 +92,11 @@ def build_loaders(args):
 
 
 def build_model(args):
-    model = MGVLF(bert_model=args.bert_model, tunebert=args.tunebert, args=args)
-    model = torch.nn.DataParallel(model).cuda()
+    model = MGVLF(bert_model=args.bert_model, tunebert=args.tunebert, args=args).cuda()
+    
+    # nếu bạn thật sự có >1 GPU:
+    # if torch.cuda.device_count() > 1:
+    #     model = torch.nn.DataParallel(model).cuda()
 
     if args.pretrain:
         model = load_pretrain(model, args, logging)
@@ -106,8 +109,8 @@ def build_model(args):
 
     # ==== group params (SO SÁNH THEO IDENTITY) ====
     if args.tunebert:
-        visu_param = list(model.module.visumodel.parameters())
-        text_param = list(model.module.textmodel.parameters())
+        visu_param = list(model.visumodel.parameters())
+        text_param = list(model.textmodel.parameters())
         visu_ids = {id(p) for p in visu_param}
         text_ids = {id(p) for p in text_param}
         rest_param = [p for p in model.parameters() if id(p) not in visu_ids and id(p) not in text_ids]
@@ -130,7 +133,7 @@ def build_model(args):
         sum_rest = sum(p.nelement() for p in rest_param)
         print('visu, text, fusion module parameters:', sum_visu, sum_text, sum_rest)
     else:
-        visu_param = list(model.module.visumodel.parameters())
+        visu_param = list(model.visumodel.parameters())
         visu_ids = {id(p) for p in visu_param}
         rest_param = [p for p in model.parameters() if id(p) not in visu_ids]
 
@@ -146,7 +149,7 @@ def build_model(args):
         )
 
         sum_visu = sum(p.nelement() for p in visu_param)
-        sum_text_total = sum(p.nelement() for p in model.module.textmodel.parameters())
+        sum_text_total = sum(p.nelement() for p in model.textmodel.parameters())
         sum_rest = sum(p.nelement() for p in rest_param)
         print('visu, text(total), fusion(rest) parameters:', sum_visu, sum_text_total, sum_rest)
 
