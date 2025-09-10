@@ -29,8 +29,8 @@ from utils.ema import EMA
 def parse_args():
     parser = argparse.ArgumentParser(description='MGVLF Train/Val')
     parser.add_argument('--size', default=640, type=int, help='image size')
-    parser.add_argument('--images_path', type=str, default='./DIOR_RSVG/JPEGImages')
-    parser.add_argument('--anno_path', type=str, default='./DIOR_RSVG/Annotations')
+    parser.add_argument('--images_path', type=str, default='/kaggle/input/dior-rsvg/DIOR_RSVG/JPEGImages')
+    parser.add_argument('--anno_path', type=str, default='/kaggle/input/dior-rsvg/DIOR_RSVG/Annotations')
     parser.add_argument('--time', default=40, type=int, help='max language length')
     parser.add_argument('--gpu', default='0', help='gpu id')
     parser.add_argument('--workers', default=0, type=int)

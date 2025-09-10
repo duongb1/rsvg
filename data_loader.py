@@ -30,7 +30,7 @@ class RSVGDataset(data.Dataset):
 
         self.tokenizer = AutoTokenizer.from_pretrained(bert_model, use_fast=True)
 
-        file = open('./DIOR_RSVG/' + split + '.txt', "r").readlines()
+        file = open('/kaggle/input/dior-rsvg/DIOR_RSVG/' + split + '.txt', "r").readlines()
         Index = [int(index.strip('\n')) for index in file]
         count = 0
         annotations = filelist(anno_path, '.xml')
