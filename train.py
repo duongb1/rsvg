@@ -8,7 +8,6 @@ import numpy as np
 
 import torch
 import torch.backends.cudnn as cudnn
-import torch.utils.data.distributed
 import torch.optim
 from torch.utils.data import DataLoader
 from torch.autograd import Variable
