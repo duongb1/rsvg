@@ -37,10 +37,10 @@ def parse_args():
     parser.add_argument('--nb_epoch', default=150, type=int)
     parser.add_argument('--lr', default=1e-4, type=float)
     parser.add_argument('--lr_dec', default=0.1, type=float)  # giữ để tương thích log, không dùng
-    parser.add_argument('--batch_size', default=10, type=int)
+    parser.add_argument('--batch_size', default=16, type=int)
     parser.add_argument('--resume', default='', type=str, metavar='PATH')
     parser.add_argument('--pretrain', default='', type=str, metavar='PATH')
-    parser.add_argument('--print_freq', '-p', default=50, type=int)
+    parser.add_argument('--print_freq', '-p', default=100, type=int)
     parser.add_argument('--savename', default='default', type=str)
     parser.add_argument('--seed', default=13, type=int)
     parser.add_argument('--bert_model', default='bert-base-uncased', type=str)
