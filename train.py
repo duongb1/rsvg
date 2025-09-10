@@ -20,7 +20,7 @@ from torchvision.transforms import Compose, ToTensor, Normalize
 
 from data_loader import RSVGDataset
 from models.model import MGVLF
-from models.loss import Reg_Loss, GIoU_Loss
+from utils.loss import Reg_Loss, GIoU_Loss
 from utils.utils import AverageMeter, xyxy2xywh, bbox_iou, adjust_learning_rate
 from utils.checkpoint import save_checkpoint, load_pretrain, load_resume
 
